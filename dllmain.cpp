@@ -8,7 +8,6 @@
 #include "features.h"
 #include "CustomTextureLoader.h"
 #include "Log.h"
-#include "includes/injector/injector.hpp"
 
 using namespace ngg::mw;
 

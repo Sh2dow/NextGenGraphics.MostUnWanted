@@ -19,11 +19,5 @@ public:
 
     // Called from HookedPresent to provide the D3D device
     static void SetD3DDevice(IDirect3DDevice9* device);
-
-    // Called from HookedSetTexture to capture texture pointer
-    static void CaptureTexturePointer(DWORD stage, IDirect3DBaseTexture9* pTexture);
-
-    // Called from HookedSetTexture to handle texture swapping
-    static HRESULT OnSetTexture(SetTextureFn originalSetTexture, IDirect3DDevice9* device, DWORD stage, IDirect3DBaseTexture9* pTexture);
 };
 

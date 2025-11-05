@@ -23,13 +23,20 @@ using json = nlohmann::json;
 // ============================================================================
 // ORIGINAL ASI CUSTOMTEXTURELOADER RE-IMPLEMENTATION
 // ============================================================================
-// CRITICAL DISCOVERY: The original ASI does NOT load textures synchronously!
-// Hook 1 at 0x6C3A30: Parse JSON and build hash → file path map (FAST!)
-//                     Called when graphics settings change
-//                     Only stores file paths, NOT actual textures
+// CRITICAL DISCOVERY: Hook 1 at 0x6C3A30 (nullsub_33) is ONLY called when graphics settings change!
+// It's NOT called at startup, so we must manually load textures in enable().
+//
+// Hook 1 at 0x6C3A30: Parse JSON and load ALL textures (sub_1005DD50)
+//                     Called ONLY when graphics settings change (NOT at startup!)
+//                     nullsub_33 is just a "retn" instruction - a placeholder
 // Hook 2 at 0x6C6C97: Swap textures every frame (sub_1005F060/sub_1005F070)
-//                     Loads textures ON-DEMAND when first needed
-//                     This is why startup is fast - textures load during gameplay!
+//                     Just swaps textures - NO loading (textures already loaded)
+//                     This prevents stuttering during gameplay!
+//
+// Our implementation:
+// - enable(): Manually load ALL textures at startup (prevents on-demand loading stutter)
+// - Hook 1: Reload all textures when graphics settings change
+// - Hook 2: Swap textures every frame (no loading)
 // ============================================================================
 
 
@@ -42,9 +49,6 @@ namespace
 
     // Hash → loaded 2D texture mapping (populated on-demand during Hook 2)
     std::unordered_map<uint32_t, IDirect3DTexture9*> g_textureMap;
-
-    // Hash → loaded volume texture mapping (for 3D textures like LUTs)
-    std::unordered_map<uint32_t, IDirect3DVolumeTexture9*> g_volumeTextureMap;
 
     // Mutex for thread-safe texture loading
     std::mutex g_textureMutex;
@@ -72,51 +76,74 @@ namespace
         return hash;
     }
 
-    // Parse JSON and build hash → file path map (FAST - no texture loading!)
-    void LoadTexturePaths()
+    // Parse JSON and load ALL textures (matches original ASI behavior)
+    void LoadAllTextures()
     {
         try
         {
             fs::path gameDir = fs::current_path();
 
-            // Optimization: Skip re-parsing if already loaded
+            // Optimization: Skip re-loading if already loaded
             if (g_pathsLoaded)
                 return;
 
-            asi_log::Log("CustomTextureLoader: Parsing texture files...");
+            if (!g_d3dDevice)
+            {
+                asi_log::Log("CustomTextureLoader: ERROR - D3D device not set!");
+                return;
+            }
+
+            asi_log::Log("CustomTextureLoader: Loading all textures...");
 
             // Optimization: Reserve capacity for expected texture count
             g_texturePathMap.reserve(EXPECTED_TEXTURE_COUNT);
+            g_textureMap.reserve(EXPECTED_TEXTURE_COUNT);
 
-            int totalCount = 0;
+            int totalPaths = 0;
+            int loaded2D = 0;
+            int failed = 0;
 
             // 1. Load generic/global textures (water, noise, etc.)
             fs::path genericDir = gameDir / "NextGenGraphics" / "GenericTextures";
             if (fs::exists(genericDir))
             {
-                int genericCount = 0;
                 for (const auto& entry : fs::directory_iterator(genericDir))
                 {
                     if (!entry.is_regular_file())
                         continue;
 
                     std::string filename = entry.path().stem().string(); // Without extension
+                    std::string extension = entry.path().extension().string();
                     uint32_t hash = CalcHash(filename);
+                    std::string fullPath = entry.path().string();
 
-                    g_texturePathMap[hash] = entry.path().string();
-                    genericCount++;
+                    g_texturePathMap[hash] = fullPath;
+                    totalPaths++;
+
+                    // Load as 2D texture
+                    IDirect3DTexture9* texture = nullptr;
+                    HRESULT hr = D3DXCreateTextureFromFileA(
+                        g_d3dDevice,
+                        fullPath.c_str(),
+                        &texture
+                    );
+
+                    if (SUCCEEDED(hr) && texture)
+                    {
+                        g_textureMap[hash] = texture;
+                        loaded2D++;
+                    }
+                    else
+                    {
+                        failed++;
+                    }
                 }
-
-                asi_log::Log("CustomTextureLoader: Found %d generic textures", genericCount);
-                totalCount += genericCount;
             }
 
             // 2. Load texture packs (custom textures)
             fs::path texturePacksDir = gameDir / "NextGenGraphics" / "TexturePacks";
             if (fs::exists(texturePacksDir))
             {
-                int packCount = 0;
-
                 for (const auto& packEntry : fs::directory_iterator(texturePacksDir))
                 {
                     if (!packEntry.is_directory())
@@ -133,7 +160,7 @@ namespace
                     std::string rootDir = packInfo["rootDirectory"];
                     fs::path texturesDir = packEntry.path() / rootDir;
 
-                    // Build hash → file path mappings (NO texture loading!)
+                    // Load all textures from this pack
                     for (const auto& mapping : packInfo["textureMappings"])
                     {
                         std::string gameId = mapping["gameId"];
@@ -142,123 +169,54 @@ namespace
                         uint32_t hash = CalcHash(gameId);
                         fs::path fullPath = texturesDir / texturePath;
 
-                        if (fs::exists(fullPath))
+                        if (!fs::exists(fullPath))
+                            continue;
+
+                        g_texturePathMap[hash] = fullPath.string();
+                        totalPaths++;
+
+                        // Load texture immediately (2D only for texture packs)
+                        IDirect3DTexture9* texture = nullptr;
+                        HRESULT hr = D3DXCreateTextureFromFileA(
+                            g_d3dDevice,
+                            fullPath.string().c_str(),
+                            &texture
+                        );
+
+                        if (SUCCEEDED(hr) && texture)
                         {
-                            g_texturePathMap[hash] = fullPath.string();
-                            packCount++;
+                            g_textureMap[hash] = texture;
+                            loaded2D++;
+                        }
+                        else
+                        {
+                            failed++;
                         }
                     }
                 }
-
-                asi_log::Log("CustomTextureLoader: Parsed %d texture pack mappings", packCount);
-                totalCount += packCount;
             }
 
-            asi_log::Log("CustomTextureLoader: Total %d texture mappings ready (will load on-demand)", totalCount);
+            asi_log::Log("CustomTextureLoader: Loaded %d textures (%d failed) from %d total paths",
+                        loaded2D, failed, totalPaths);
             g_pathsLoaded = true;
         }
         catch (const std::exception& e)
         {
-            asi_log::Log("CustomTextureLoader: Error parsing files: %s", e.what());
+            asi_log::Log("CustomTextureLoader: Error loading textures: %s", e.what());
         }
     }
 
-    // Load texture on-demand (called from Hook 2 when texture is first needed)
-    IDirect3DTexture9* LoadTextureOnDemand(uint32_t hash)
+    // Get already-loaded texture by hash (called from Hook 2)
+    IDirect3DTexture9* GetTexture(uint32_t hash)
     {
-        if (!g_d3dDevice || hash == 0)
+        if (hash == 0)
             return nullptr;
 
-        // Optimization: Single mutex lock instead of double lock
         std::lock_guard<std::mutex> lock(g_textureMutex);
 
-        // Check if already loaded
         auto it = g_textureMap.find(hash);
         if (it != g_textureMap.end())
             return it->second;
-
-        // Find file path (no lock needed - path map is read-only after init)
-        auto pathIt = g_texturePathMap.find(hash);
-        if (pathIt == g_texturePathMap.end())
-            return nullptr;
-
-        // Load texture (D3DX call is thread-safe)
-        IDirect3DTexture9* texture = nullptr;
-        HRESULT hr = D3DXCreateTextureFromFileA(
-            g_d3dDevice,
-            pathIt->second.c_str(),
-            &texture
-        );
-
-        if (SUCCEEDED(hr) && texture)
-        {
-            g_textureMap[hash] = texture;
-
-            // One-time log for generic textures (from GenericTextures folder)
-            if (pathIt->second.find("GenericTextures") != std::string::npos)
-            {
-                if (g_loggedGenericTextures.insert(hash).second)
-                {
-                    // Extract filename from path
-                    fs::path filePath(pathIt->second);
-                    std::string filename = filePath.filename().string();
-                    asi_log::Log("CustomTextureLoader: Generic texture bound - %s (hash: 0x%08X)",
-                                 filename.c_str(), hash);
-                }
-            }
-
-            return texture;
-        }
-
-        return nullptr;
-    }
-
-    // Load volume texture on-demand (for 3D textures like LUTs, noise, etc.)
-    IDirect3DVolumeTexture9* LoadVolumeTextureOnDemand(uint32_t hash)
-    {
-        if (!g_d3dDevice || hash == 0)
-            return nullptr;
-
-        // Optimization: Single mutex lock
-        std::lock_guard<std::mutex> lock(g_textureMutex);
-
-        // Check if already loaded
-        auto it = g_volumeTextureMap.find(hash);
-        if (it != g_volumeTextureMap.end())
-            return it->second;
-
-        // Find file path
-        auto pathIt = g_texturePathMap.find(hash);
-        if (pathIt == g_texturePathMap.end())
-            return nullptr;
-
-        // Load volume texture
-        IDirect3DVolumeTexture9* volumeTexture = nullptr;
-        HRESULT hr = D3DXCreateVolumeTextureFromFileA(
-            g_d3dDevice,
-            pathIt->second.c_str(),
-            &volumeTexture
-        );
-
-        if (SUCCEEDED(hr) && volumeTexture)
-        {
-            g_volumeTextureMap[hash] = volumeTexture;
-
-            // One-time log for generic volume textures (from GenericTextures folder)
-            if (pathIt->second.find("GenericTextures") != std::string::npos)
-            {
-                if (g_loggedGenericTextures.insert(hash).second)
-                {
-                    // Extract filename from path
-                    fs::path filePath(pathIt->second);
-                    std::string filename = filePath.filename().string();
-                    asi_log::Log("CustomTextureLoader: Generic volume texture bound - %s (hash: 0x%08X)",
-                                 filename.c_str(), hash);
-                }
-            }
-
-            return volumeTexture;
-        }
 
         return nullptr;
     }
@@ -349,10 +307,10 @@ namespace
         uint32_t hash2 = wrapper2 ? *reinterpret_cast<uint32_t*>(reinterpret_cast<char*>(wrapper2) + 0x24) : 0;
         uint32_t hash3 = wrapper3 ? *reinterpret_cast<uint32_t*>(reinterpret_cast<char*>(wrapper3) + 0x24) : 0;
 
-        // Optimization: Load textures on-demand (hash check is done inside LoadTextureOnDemand)
-        IDirect3DTexture9* customTex1 = LoadTextureOnDemand(hash1);
-        IDirect3DTexture9* customTex2 = LoadTextureOnDemand(hash2);
-        IDirect3DTexture9* customTex3 = LoadTextureOnDemand(hash3);
+        // Get already-loaded textures (all textures loaded in Hook 1)
+        IDirect3DTexture9* customTex1 = GetTexture(hash1);
+        IDirect3DTexture9* customTex2 = GetTexture(hash2);
+        IDirect3DTexture9* customTex3 = GetTexture(hash3);
 
         // If no custom textures found, skip
         if (!customTex1 && !customTex2 && !customTex3)
@@ -375,13 +333,24 @@ namespace
             g_swapSuccessCount++;
     }
 
-    // Hook 1: Parse JSON and build path map (FAST - no texture loading!)
+    // Hook 1: Load all textures (called on startup and when graphics settings change)
     __declspec(naked) void HookLoad()
     {
         __asm
         {
             pushad
-            call LoadTexturePaths
+        }
+
+        // Log that Hook 1 was called
+        static int hookCallCount = 0;
+        hookCallCount++;
+        asi_log::Log("CustomTextureLoader: Hook 1 called (count: %d) - loading all textures...", hookCallCount);
+
+        // Load all textures
+        LoadAllTextures();
+
+        __asm
+        {
             popad
             ret
         }
@@ -420,19 +389,19 @@ void CustomTextureLoader::enable()
 
     asi_log::Log("CustomTextureLoader: Installing hooks...");
 
-    // Optimization: Reserve capacity for texture cache
-    g_textureMap.reserve(EXPECTED_TEXTURE_COUNT);
-
-    // Parse JSON files immediately at startup (FAST - no texture loading!)
-    LoadTexturePaths();
-
-    // Install Hook 1: Re-parse JSON when graphics settings change
+    // Install Hook 1: Load all textures (called when graphics settings change)
     injector::MakeJMP(ngg::mw::HOOK_LOAD_ADDR, &HookLoad, true);
-    
-    // Install Hook 2: Texture swapping (loads textures on-demand)
+
+    // Install Hook 2: Texture swapping (just swaps, no loading)
     injector::MakeJMP(ngg::mw::HOOK_SWAP_ADDR, &HookSwap, true);
-    
-    asi_log::Log("CustomTextureLoader: Initialization complete - textures will load on-demand");
+
+    asi_log::Log("CustomTextureLoader: Hooks installed");
+
+    // CRITICAL: Hook 1 at 0x6C3A30 (nullsub_33) is ONLY called when graphics settings change,
+    // NOT at startup! We must manually load all textures here to avoid on-demand loading stutter.
+    asi_log::Log("CustomTextureLoader: Loading all textures at startup...");
+    LoadAllTextures();
+    asi_log::Log("CustomTextureLoader: Startup texture loading complete");
 }
 
 // Disable feature (cleanup)
@@ -451,14 +420,6 @@ void CustomTextureLoader::disable()
                 pair.second->Release();
         }
         g_textureMap.clear();
-
-        // Release volume textures
-        for (auto& pair : g_volumeTextureMap)
-        {
-            if (pair.second)
-                pair.second->Release();
-        }
-        g_volumeTextureMap.clear();
     }
 
     g_texturePathMap.clear();
