@@ -11,9 +11,9 @@
 #include <windows.h>
 #include <d3dx9.h>
 
-#include "GameAddresses.h"
 #include "Log.h"
 #include "MinHook.h"
+#include "NFSMW_PreFEngHook.h"
 #include "includes/json/include/nlohmann/json.hpp"
 
 namespace fs = std::filesystem;

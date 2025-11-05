@@ -4,8 +4,8 @@
 #include <memory>
 #include "features.h"
 #include "CustomTextureLoader.h"
-#include "NFSMW_PreFEngHook.h"
 #include "MinHook.h"
+#include "NFSMW_PreFEngHook.h"
 
 using namespace ngg::mw;
 

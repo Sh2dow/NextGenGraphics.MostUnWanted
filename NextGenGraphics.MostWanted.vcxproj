@@ -57,7 +57,7 @@
         <ClCompile>
             <LanguageStandard>stdcpp17</LanguageStandard>
             <AdditionalIncludeDirectories>
-                includes\minhook\include;includes\json\include;includes\injector;includes\spdlog\include;
+                includes\minhook\include;includes\json\include;includes\spdlog\include;
                 $(DXSDK_DIR)Include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
         </ClCompile>
         <Link>
@@ -104,7 +104,6 @@
     <ItemGroup>
         <ClInclude Include="CustomTextureLoader.h"/>
         <ClInclude Include="features.h"/>
-        <ClInclude Include="GameAddresses.h" />
         <ClInclude Include="includes\CPatch.h" />
         <ClInclude Include="includes\IniReader.h" />
         <ClInclude Include="includes\minhook\include\MinHook.h" />

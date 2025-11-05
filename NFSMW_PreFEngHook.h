@@ -1,11 +1,10 @@
 #pragma once
-#include "features.h"
 
 namespace ngg
 {
     namespace mw
     {
-        constexpr uintptr_t FEMANAGER_INSTANCE_ADDR = 0x0091CAE0; // Confirmed in your GameAddresses.h
+        constexpr uintptr_t FEMANAGER_INSTANCE_ADDR = 0x0091CAE0;
         // constexpr uintptr_t USERPROFILE_PTR = (*(int*)(*(int*)((*(int*)FEMANAGER_INSTANCE_ADDR) + 0xD4))); // NFSC style
         constexpr uintptr_t PROFILEMANAGER_INSTANCE_ADDR = 0x00925E5C;
         constexpr uintptr_t USERPROFILE_OFFSET = 0x0C; // needs confirmation via IDA
@@ -26,5 +25,19 @@ namespace ngg
         constexpr uintptr_t kMotionBlur_F1D2 = 0x006DF1D2;
 
         constexpr uintptr_t LoadedFlagMaybe = 0x982C39;
+
+        
+        
+        // Game addresses
+        constexpr uintptr_t HOOK_LOAD_ADDR = 0x6C3A30;      // nullsub_33
+        constexpr uintptr_t HOOK_SWAP_ADDR = 0x6C6C97;      // Epilogue of sub_6C68B0
+
+        // Game texture wrapper addresses
+        constexpr uintptr_t GAME_TEX_WRAPPER_1 = 0x982CB4;  // Pointer to diffuse texture wrapper
+        constexpr uintptr_t GAME_TEX_WRAPPER_2 = 0x982CB8;  // Pointer to normal texture wrapper
+        constexpr uintptr_t GAME_TEX_WRAPPER_3 = 0x982CC0;  // Pointer to specular texture wrapper
+
+        // Game context for material API
+        constexpr uintptr_t GAME_CONTEXT_PTR = 0x982C80;  // Pointer to game context/state object
     }
 }
