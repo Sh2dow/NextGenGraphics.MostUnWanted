@@ -5,15 +5,16 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <fstream>
 #include <mutex>
 
 #include <windows.h>
 #include <d3dx9.h>
+#include "NFSMW_PreFEngHook.h"
 
 #include "Log.h"
-#include "MinHook.h"
-#include "NFSMW_PreFEngHook.h"
+#include "includes/injector/injector.hpp"
 #include "includes/json/include/nlohmann/json.hpp"
 
 namespace fs = std::filesystem;
@@ -39,8 +40,11 @@ namespace
     // Hash → file path mapping (built during Hook 1)
     std::unordered_map<uint32_t, std::string> g_texturePathMap;
 
-    // Hash → loaded texture mapping (populated on-demand during Hook 2)
+    // Hash → loaded 2D texture mapping (populated on-demand during Hook 2)
     std::unordered_map<uint32_t, IDirect3DTexture9*> g_textureMap;
+
+    // Hash → loaded volume texture mapping (for 3D textures like LUTs)
+    std::unordered_map<uint32_t, IDirect3DVolumeTexture9*> g_volumeTextureMap;
 
     // Mutex for thread-safe texture loading
     std::mutex g_textureMutex;
@@ -48,6 +52,16 @@ namespace
     bool g_pathsLoaded = false;
     uint32_t g_swapCallCount = 0;
     uint32_t g_swapSuccessCount = 0;
+
+    // Track which generic textures have been logged (one-time logging)
+    std::unordered_set<uint32_t> g_loggedGenericTextures;
+
+    // Optimization: Reserve capacity for expected texture count (1000-2000+)
+    // No cache size limit - textures are loaded on-demand and kept in memory
+    constexpr size_t EXPECTED_TEXTURE_COUNT = 2000;
+
+    // Optimization: Track directory modification time to avoid re-parsing unchanged JSON
+    fs::file_time_type g_lastDirModTime;
 
     // bStringHash from game at 0x460BF0 (DJB hash variant)
     constexpr uint32_t CalcHash(std::string_view str)
@@ -61,88 +75,114 @@ namespace
     // Parse JSON and build hash → file path map (FAST - no texture loading!)
     void LoadTexturePaths()
     {
-        if (g_pathsLoaded)
-            return;
-
-        asi_log::Log("CustomTextureLoader: Parsing texture pack JSON files...");
-
         try
         {
-            // Find TexturePacks directory
             fs::path gameDir = fs::current_path();
-            fs::path texturePacksDir = gameDir / "NextGenGraphics" / "TexturePacks";
 
-            if (!fs::exists(texturePacksDir))
-            {
-                asi_log::Log("CustomTextureLoader: TexturePacks directory not found");
+            // Optimization: Skip re-parsing if already loaded
+            if (g_pathsLoaded)
                 return;
+
+            asi_log::Log("CustomTextureLoader: Parsing texture files...");
+
+            // Optimization: Reserve capacity for expected texture count
+            g_texturePathMap.reserve(EXPECTED_TEXTURE_COUNT);
+
+            int totalCount = 0;
+
+            // 1. Load generic/global textures (water, noise, etc.)
+            fs::path genericDir = gameDir / "NextGenGraphics" / "GenericTextures";
+            if (fs::exists(genericDir))
+            {
+                int genericCount = 0;
+                for (const auto& entry : fs::directory_iterator(genericDir))
+                {
+                    if (!entry.is_regular_file())
+                        continue;
+
+                    std::string filename = entry.path().stem().string(); // Without extension
+                    uint32_t hash = CalcHash(filename);
+
+                    g_texturePathMap[hash] = entry.path().string();
+                    genericCount++;
+                }
+
+                asi_log::Log("CustomTextureLoader: Found %d generic textures", genericCount);
+                totalCount += genericCount;
             }
 
-            int mappingCount = 0;
-
-            // Scan all texture packs
-            for (const auto& packEntry : fs::directory_iterator(texturePacksDir))
+            // 2. Load texture packs (custom textures)
+            fs::path texturePacksDir = gameDir / "NextGenGraphics" / "TexturePacks";
+            if (fs::exists(texturePacksDir))
             {
-                if (!packEntry.is_directory())
-                    continue;
+                int packCount = 0;
 
-                fs::path jsonPath = packEntry.path() / "TexturePackInfo.json";
-                if (!fs::exists(jsonPath))
-                    continue;
-
-                // Parse JSON
-                std::ifstream jsonFile(jsonPath);
-                json packInfo = json::parse(jsonFile);
-
-                std::string rootDir = packInfo["rootDirectory"];
-                fs::path texturesDir = packEntry.path() / rootDir;
-
-                // Build hash → file path mappings (NO texture loading!)
-                for (const auto& mapping : packInfo["textureMappings"])
+                for (const auto& packEntry : fs::directory_iterator(texturePacksDir))
                 {
-                    std::string gameId = mapping["gameId"];
-                    std::string texturePath = mapping["texturePath"];
+                    if (!packEntry.is_directory())
+                        continue;
 
-                    uint32_t hash = CalcHash(gameId);
-                    fs::path fullPath = texturesDir / texturePath;
+                    fs::path jsonPath = packEntry.path() / "TexturePackInfo.json";
+                    if (!fs::exists(jsonPath))
+                        continue;
 
-                    if (fs::exists(fullPath))
+                    // Parse JSON
+                    std::ifstream jsonFile(jsonPath);
+                    json packInfo = json::parse(jsonFile);
+
+                    std::string rootDir = packInfo["rootDirectory"];
+                    fs::path texturesDir = packEntry.path() / rootDir;
+
+                    // Build hash → file path mappings (NO texture loading!)
+                    for (const auto& mapping : packInfo["textureMappings"])
                     {
-                        g_texturePathMap[hash] = fullPath.string();
-                        mappingCount++;
+                        std::string gameId = mapping["gameId"];
+                        std::string texturePath = mapping["texturePath"];
+
+                        uint32_t hash = CalcHash(gameId);
+                        fs::path fullPath = texturesDir / texturePath;
+
+                        if (fs::exists(fullPath))
+                        {
+                            g_texturePathMap[hash] = fullPath.string();
+                            packCount++;
+                        }
                     }
                 }
+
+                asi_log::Log("CustomTextureLoader: Parsed %d texture pack mappings", packCount);
+                totalCount += packCount;
             }
 
-            asi_log::Log("CustomTextureLoader: Parsed %d texture mappings (textures will load on-demand)", mappingCount);
+            asi_log::Log("CustomTextureLoader: Total %d texture mappings ready (will load on-demand)", totalCount);
             g_pathsLoaded = true;
         }
         catch (const std::exception& e)
         {
-            asi_log::Log("CustomTextureLoader: Error parsing JSON: %s", e.what());
+            asi_log::Log("CustomTextureLoader: Error parsing files: %s", e.what());
         }
     }
 
     // Load texture on-demand (called from Hook 2 when texture is first needed)
     IDirect3DTexture9* LoadTextureOnDemand(uint32_t hash)
     {
-        if (!g_d3dDevice)
+        if (!g_d3dDevice || hash == 0)
             return nullptr;
 
-        // Check if already loaded
-        {
-            std::lock_guard<std::mutex> lock(g_textureMutex);
-            auto it = g_textureMap.find(hash);
-            if (it != g_textureMap.end())
-                return it->second;
-        }
+        // Optimization: Single mutex lock instead of double lock
+        std::lock_guard<std::mutex> lock(g_textureMutex);
 
-        // Find file path
+        // Check if already loaded
+        auto it = g_textureMap.find(hash);
+        if (it != g_textureMap.end())
+            return it->second;
+
+        // Find file path (no lock needed - path map is read-only after init)
         auto pathIt = g_texturePathMap.find(hash);
         if (pathIt == g_texturePathMap.end())
             return nullptr;
 
-        // Load texture
+        // Load texture (D3DX call is thread-safe)
         IDirect3DTexture9* texture = nullptr;
         HRESULT hr = D3DXCreateTextureFromFileA(
             g_d3dDevice,
@@ -152,12 +192,116 @@ namespace
 
         if (SUCCEEDED(hr) && texture)
         {
-            std::lock_guard<std::mutex> lock(g_textureMutex);
             g_textureMap[hash] = texture;
+
+            // One-time log for generic textures (from GenericTextures folder)
+            if (pathIt->second.find("GenericTextures") != std::string::npos)
+            {
+                if (g_loggedGenericTextures.insert(hash).second)
+                {
+                    // Extract filename from path
+                    fs::path filePath(pathIt->second);
+                    std::string filename = filePath.filename().string();
+                    asi_log::Log("CustomTextureLoader: Generic texture bound - %s (hash: 0x%08X)",
+                                 filename.c_str(), hash);
+                }
+            }
+
             return texture;
         }
 
         return nullptr;
+    }
+
+    // Load volume texture on-demand (for 3D textures like LUTs, noise, etc.)
+    IDirect3DVolumeTexture9* LoadVolumeTextureOnDemand(uint32_t hash)
+    {
+        if (!g_d3dDevice || hash == 0)
+            return nullptr;
+
+        // Optimization: Single mutex lock
+        std::lock_guard<std::mutex> lock(g_textureMutex);
+
+        // Check if already loaded
+        auto it = g_volumeTextureMap.find(hash);
+        if (it != g_volumeTextureMap.end())
+            return it->second;
+
+        // Find file path
+        auto pathIt = g_texturePathMap.find(hash);
+        if (pathIt == g_texturePathMap.end())
+            return nullptr;
+
+        // Load volume texture
+        IDirect3DVolumeTexture9* volumeTexture = nullptr;
+        HRESULT hr = D3DXCreateVolumeTextureFromFileA(
+            g_d3dDevice,
+            pathIt->second.c_str(),
+            &volumeTexture
+        );
+
+        if (SUCCEEDED(hr) && volumeTexture)
+        {
+            g_volumeTextureMap[hash] = volumeTexture;
+
+            // One-time log for generic volume textures (from GenericTextures folder)
+            if (pathIt->second.find("GenericTextures") != std::string::npos)
+            {
+                if (g_loggedGenericTextures.insert(hash).second)
+                {
+                    // Extract filename from path
+                    fs::path filePath(pathIt->second);
+                    std::string filename = filePath.filename().string();
+                    asi_log::Log("CustomTextureLoader: Generic volume texture bound - %s (hash: 0x%08X)",
+                                 filename.c_str(), hash);
+                }
+            }
+
+            return volumeTexture;
+        }
+
+        return nullptr;
+    }
+
+    // Optimization: Helper function to set material texture (reduces code duplication)
+    bool SetMaterialTexture(void* material, const char* paramName, IDirect3DTexture9* texture)
+    {
+        if (!material || !texture)
+            return false;
+
+        // Get material vtable
+        void** vtable = *reinterpret_cast<void***>(material);
+        void* getParameterFn = *reinterpret_cast<void**>(reinterpret_cast<char*>(vtable) + 0x28);
+        void* setValueFn = *reinterpret_cast<void**>(reinterpret_cast<char*>(vtable) + 0x50);
+
+        void* param = nullptr;
+
+        // Call GetParameter
+        __asm {
+            mov eax, paramName
+            push eax
+            push 0
+            mov ecx, material
+            push ecx
+            call getParameterFn
+            mov param, eax
+        }
+
+        if (!param)
+            return false;
+
+        // Call SetValue
+        __asm {
+            push 4
+            lea eax, texture
+            push eax
+            push param
+            mov ecx, material
+            push ecx
+            call setValueFn
+        }
+
+        return true;
     }
 
     // Swap textures (called from Hook 2)
@@ -205,123 +349,30 @@ namespace
         uint32_t hash2 = wrapper2 ? *reinterpret_cast<uint32_t*>(reinterpret_cast<char*>(wrapper2) + 0x24) : 0;
         uint32_t hash3 = wrapper3 ? *reinterpret_cast<uint32_t*>(reinterpret_cast<char*>(wrapper3) + 0x24) : 0;
 
-        // Load textures on-demand (only if not already loaded)
+        // Optimization: Load textures on-demand (hash check is done inside LoadTextureOnDemand)
         IDirect3DTexture9* customTex1 = LoadTextureOnDemand(hash1);
-        IDirect3DTexture9* customTex2 = hash2 ? LoadTextureOnDemand(hash2) : nullptr;
-        IDirect3DTexture9* customTex3 = hash3 ? LoadTextureOnDemand(hash3) : nullptr;
+        IDirect3DTexture9* customTex2 = LoadTextureOnDemand(hash2);
+        IDirect3DTexture9* customTex3 = LoadTextureOnDemand(hash3);
 
         // If no custom textures found, skip
         if (!customTex1 && !customTex2 && !customTex3)
             return;
 
-        // Get material vtable
-        void** vtable = *reinterpret_cast<void***>(material);
-
-        // Get function pointers from vtable (accessed by BYTE offset!)
-        void* getParameterFn = *reinterpret_cast<void**>(reinterpret_cast<char*>(vtable) + 0x28);
-        void* setValueFn = *reinterpret_cast<void**>(reinterpret_cast<char*>(vtable) + 0x50);
-
+        // Optimization: Use helper function to reduce code duplication
         // Parameter name strings
         static const char* diffuseMapStr = "DiffuseMap";
         static const char* normalMapStr = "NormalMapTexture";
         static const char* specularMapStr = "SPECULARMAPTEXTURE";
 
-        // Set diffuse texture if we found a custom one
-        if (customTex1)
-        {
-            void* param = nullptr;
+        // Set textures using helper function
+        if (customTex1 && SetMaterialTexture(material, diffuseMapStr, customTex1))
+            g_swapSuccessCount++;
 
-            // Call GetParameter using inline assembly to match the original ASI exactly
-            // Assembly: push "DiffuseMap"; push 0; push material; mov ecx, material; call [vtable+28h]
-            __asm {
-                mov eax, diffuseMapStr
-                push eax
-                push 0
-                mov ecx, material
-                push ecx
-                call getParameterFn
-                mov param, eax
-            }
+        if (customTex2 && SetMaterialTexture(material, normalMapStr, customTex2))
+            g_swapSuccessCount++;
 
-            if (param)
-            {
-                // Call SetValue using inline assembly
-                // Assembly: push 4; push &customTex; push param; push material; mov ecx, material; call [vtable+50h]
-                __asm {
-                    push 4
-                    lea eax, customTex1
-                    push eax
-                    push param
-                    mov ecx, material
-                    push ecx
-                    call setValueFn
-                }
-
-                g_swapSuccessCount++;
-            }
-        }
-
-        // Set normal texture if we found a custom one
-        if (customTex2 && wrapper2)
-        {
-            void* param = nullptr;
-
-            __asm {
-                mov eax, normalMapStr
-                push eax
-                push 0
-                mov ecx, material
-                push ecx
-                call getParameterFn
-                mov param, eax
-            }
-
-            if (param)
-            {
-                __asm {
-                    push 4
-                    lea eax, customTex2
-                    push eax
-                    push param
-                    mov ecx, material
-                    push ecx
-                    call setValueFn
-                }
-
-                g_swapSuccessCount++;
-            }
-        }
-
-        // Set specular texture if we found a custom one
-        if (customTex3 && wrapper3)
-        {
-            void* param = nullptr;
-
-            __asm {
-                mov eax, specularMapStr
-                push eax
-                push 0
-                mov ecx, material
-                push ecx
-                call getParameterFn
-                mov param, eax
-            }
-
-            if (param)
-            {
-                __asm {
-                    push 4
-                    lea eax, customTex3
-                    push eax
-                    push param
-                    mov ecx, material
-                    push ecx
-                    call setValueFn
-                }
-
-                g_swapSuccessCount++;
-            }
-        }
+        if (customTex3 && SetMaterialTexture(material, specularMapStr, customTex3))
+            g_swapSuccessCount++;
     }
 
     // Hook 1: Parse JSON and build path map (FAST - no texture loading!)
@@ -369,29 +420,17 @@ void CustomTextureLoader::enable()
 
     asi_log::Log("CustomTextureLoader: Installing hooks...");
 
+    // Optimization: Reserve capacity for texture cache
+    g_textureMap.reserve(EXPECTED_TEXTURE_COUNT);
+
     // Parse JSON files immediately at startup (FAST - no texture loading!)
     LoadTexturePaths();
 
     // Install Hook 1: Re-parse JSON when graphics settings change
-    // injector::MakeJMP(HOOK_LOAD_ADDR, &HookLoad, true);
-    DWORD oldProtect;
-    VirtualProtect((LPVOID)ngg::mw::HOOK_LOAD_ADDR, 16, PAGE_EXECUTE_READWRITE, &oldProtect);
-
-    MH_CreateHook((LPVOID)ngg::mw::HOOK_LOAD_ADDR, &HookLoad, nullptr);
-    MH_EnableHook((LPVOID)ngg::mw::HOOK_LOAD_ADDR);
-
-    VirtualProtect((LPVOID)ngg::mw::HOOK_LOAD_ADDR, 16, oldProtect, &oldProtect);
-
+    injector::MakeJMP(ngg::mw::HOOK_LOAD_ADDR, &HookLoad, true);
     
     // Install Hook 2: Texture swapping (loads textures on-demand)
-    // injector::MakeJMP(HOOK_SWAP_ADDR, &HookSwap, true);
-    DWORD oldProtect2;
-    VirtualProtect((LPVOID)ngg::mw::HOOK_SWAP_ADDR, 16, PAGE_EXECUTE_READWRITE, &oldProtect2);
-
-    MH_CreateHook((LPVOID)ngg::mw::HOOK_SWAP_ADDR, &HookSwap, nullptr);
-    MH_EnableHook((LPVOID)ngg::mw::HOOK_SWAP_ADDR);
-
-    VirtualProtect((LPVOID)ngg::mw::HOOK_SWAP_ADDR, 16, oldProtect2, &oldProtect2);
+    injector::MakeJMP(ngg::mw::HOOK_SWAP_ADDR, &HookSwap, true);
     
     asi_log::Log("CustomTextureLoader: Initialization complete - textures will load on-demand");
 }
@@ -404,12 +443,22 @@ void CustomTextureLoader::disable()
     // Release all textures
     {
         std::lock_guard<std::mutex> lock(g_textureMutex);
+
+        // Release 2D textures
         for (auto& pair : g_textureMap)
         {
             if (pair.second)
                 pair.second->Release();
         }
         g_textureMap.clear();
+
+        // Release volume textures
+        for (auto& pair : g_volumeTextureMap)
+        {
+            if (pair.second)
+                pair.second->Release();
+        }
+        g_volumeTextureMap.clear();
     }
 
     g_texturePathMap.clear();
