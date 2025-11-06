@@ -15,11 +15,19 @@ using namespace ngg::mw;
 static std::vector<std::unique_ptr<ngg::common::Feature>> g_features;
 
 // Original Present function pointer
-typedef HRESULT(APIENTRY* PresentFn)(IDirect3DDevice9*, CONST RECT*, CONST RECT*, HWND, CONST RGNDATA*);
+typedef HRESULT (APIENTRY*PresentFn)(IDirect3DDevice9*, CONST RECT*, CONST RECT*, HWND, CONST RGNDATA*);
 PresentFn g_originalPresent = nullptr;
-static std::atomic g_vtableHooked{ false };
+static std::atomic g_vtableHooked{false};
 static void** g_patchedVTableEntry = nullptr; // pointer to the vtable slot we patched
-static void* g_savedOriginalPtr = nullptr;    // original pointer saved
+static void* g_savedOriginalPtr = nullptr; // original pointer saved
+
+// Original CreateDevice function pointer
+typedef HRESULT (APIENTRY*CreateDeviceFn)(IDirect3D9*, UINT, D3DDEVTYPE, HWND, DWORD, D3DPRESENT_PARAMETERS*,
+                                          IDirect3DDevice9**);
+CreateDeviceFn g_originalCreateDevice = nullptr;
+static std::atomic g_createDeviceHooked{false};
+static void** g_createDeviceVTableEntry = nullptr;
+static void* g_savedCreateDevicePtr = nullptr;
 
 bool triedInit = false;
 
@@ -53,8 +61,42 @@ void OnPresent()
     }
 }
 
+// Hooked CreateDevice - adds D3DCREATE_MULTITHREADED flag
+HRESULT APIENTRY HookedCreateDevice(
+    IDirect3D9* d3d,
+    UINT adapter,
+    D3DDEVTYPE deviceType,
+    HWND focusWindow,
+    DWORD behaviorFlags,
+    D3DPRESENT_PARAMETERS* presentParams,
+    IDirect3DDevice9** device)
+{
+    // CRITICAL: Add D3DCREATE_MULTITHREADED flag to allow D3DX calls from worker threads!
+    // Without this flag, D3DX calls from worker threads will corrupt internal state
+    // and cause crashes when the game calls D3DX from the main thread.
+    DWORD newBehaviorFlags = behaviorFlags | D3DCREATE_MULTITHREADED;
+
+    asi_log::Log("HookedCreateDevice: Original BehaviorFlags = 0x%08X, New BehaviorFlags = 0x%08X\n",
+                 behaviorFlags, newBehaviorFlags);
+
+    // Call original CreateDevice with modified flags
+    if (g_originalCreateDevice)
+        return g_originalCreateDevice(d3d, adapter, deviceType, focusWindow, newBehaviorFlags, presentParams, device);
+
+    // Fallback: call through vtable
+    typedef HRESULT (APIENTRY*CreateDeviceLocalFn)(IDirect3D9*, UINT, D3DDEVTYPE, HWND, DWORD, D3DPRESENT_PARAMETERS*,
+                                                   IDirect3DDevice9**);
+    void** vtable = *reinterpret_cast<void***>(d3d);
+    CreateDeviceLocalFn createDeviceFn = reinterpret_cast<CreateDeviceLocalFn>(vtable[16]);
+    if (createDeviceFn && createDeviceFn != &HookedCreateDevice)
+        return createDeviceFn(d3d, adapter, deviceType, focusWindow, newBehaviorFlags, presentParams, device);
+
+    return D3DERR_INVALIDCALL;
+}
+
 // Hooked Present (unchanged behaviour)
-HRESULT APIENTRY HookedPresent(IDirect3DDevice9* device, CONST RECT* src, CONST RECT* dest, HWND wnd, CONST RGNDATA* dirty)
+HRESULT APIENTRY HookedPresent(IDirect3DDevice9* device, CONST RECT* src, CONST RECT* dest, HWND wnd,
+                               CONST RGNDATA* dirty)
 {
     OnPresent(); // trigger Initialize logic
     CustomTextureLoader::SetD3DDevice(device);
@@ -64,7 +106,7 @@ HRESULT APIENTRY HookedPresent(IDirect3DDevice9* device, CONST RECT* src, CONST 
         return g_originalPresent(device, src, dest, wnd, dirty);
 
     // If no original, call through device's vtable (best-effort)
-    typedef HRESULT(APIENTRY* PresentLocalFn)(IDirect3DDevice9*, CONST RECT*, CONST RECT*, HWND, CONST RGNDATA*);
+    typedef HRESULT (APIENTRY*PresentLocalFn)(IDirect3DDevice9*, CONST RECT*, CONST RECT*, HWND, CONST RGNDATA*);
     void** vtable = *reinterpret_cast<void***>(device);
     PresentLocalFn presentFn = reinterpret_cast<PresentLocalFn>(vtable[17]);
     if (presentFn && presentFn != &HookedPresent)
@@ -73,14 +115,34 @@ HRESULT APIENTRY HookedPresent(IDirect3DDevice9* device, CONST RECT* src, CONST 
     return D3D_OK;
 }
 
-// Patch Present by replacing vtable[17]
+// Patch Present and CreateDevice by replacing vtable entries
 void HookPresent()
 {
-    // Create dummy device to get vtable
+    // Create dummy D3D9 object to get vtables
     IDirect3D9* d3d = Direct3DCreate9(D3D_SDK_VERSION);
     if (!d3d)
         return;
 
+    // Hook IDirect3D9::CreateDevice (index 16) to add D3DCREATE_MULTITHREADED flag
+    void** d3dVTable = *reinterpret_cast<void***>(d3d);
+    if (d3dVTable)
+    {
+        void* originalCreateDevicePtr = d3dVTable[16];
+        g_originalCreateDevice = reinterpret_cast<CreateDeviceFn>(originalCreateDevicePtr);
+
+        if (MakeVTableHook(d3dVTable, 16, reinterpret_cast<void*>(&HookedCreateDevice), &g_savedCreateDevicePtr))
+        {
+            g_createDeviceHooked.store(true);
+            g_createDeviceVTableEntry = &d3dVTable[16];
+            asi_log::Log("HookPresent: IDirect3D9::CreateDevice hooked successfully\n");
+        }
+        else
+        {
+            asi_log::Log("HookPresent: Failed to hook IDirect3D9::CreateDevice\n");
+        }
+    }
+
+    // Now create dummy device to get IDirect3DDevice9 vtable
     D3DPRESENT_PARAMETERS pp = {};
     pp.Windowed = TRUE;
     pp.SwapEffect = D3DSWAPEFFECT_DISCARD;
@@ -95,8 +157,8 @@ void HookPresent()
     }
 
     // Get vtable from dummyDevice
-    void** vtable = *reinterpret_cast<void***>(dummyDevice);
-    if (!vtable)
+    void** deviceVTable = *reinterpret_cast<void***>(dummyDevice);
+    if (!deviceVTable)
     {
         dummyDevice->Release();
         d3d->Release();
@@ -104,20 +166,19 @@ void HookPresent()
     }
 
     // Save original Present (index 17)
-    void* originalPtr = vtable[17];
+    void* originalPtr = deviceVTable[17];
     g_originalPresent = reinterpret_cast<PresentFn>(originalPtr);
 
-    // Install hook using helper
-    if (MakeVTableHook(vtable, 17, reinterpret_cast<void*>(&HookedPresent), &g_savedOriginalPtr))
+    // Install Present hook
+    if (MakeVTableHook(deviceVTable, 17, reinterpret_cast<void*>(&HookedPresent), &g_savedOriginalPtr))
     {
         g_vtableHooked.store(true);
-        // store pointer to the actual slot we patched for later restore
-        g_patchedVTableEntry = &vtable[17];
-        asi_log::Log("HookPresent: vtable[17] patched successfully\n");
+        g_patchedVTableEntry = &deviceVTable[17];
+        asi_log::Log("HookPresent: IDirect3DDevice9::Present hooked successfully\n");
     }
     else
     {
-        asi_log::Log("HookPresent: Failed to patch vtable[17]\n");
+        asi_log::Log("HookPresent: Failed to hook IDirect3DDevice9::Present\n");
     }
 
     // Clean up dummy objects
@@ -125,18 +186,35 @@ void HookPresent()
     d3d->Release();
 }
 
-// Restore hook (call on DLL unload)
+// Restore hooks (call on DLL unload)
 void UnhookPresent()
 {
+    // Unhook CreateDevice
+    if (g_createDeviceHooked.load() && g_createDeviceVTableEntry && g_savedCreateDevicePtr)
+    {
+        void** slot = g_createDeviceVTableEntry;
+        void** vtable = slot - 16; // reverse offset
+
+        if (UnmakeVTableHook(vtable, 16, g_savedCreateDevicePtr))
+            asi_log::Log("UnhookPresent: CreateDevice vtable slot restored\n");
+        else
+            asi_log::Log("UnhookPresent: Failed to restore CreateDevice vtable slot\n");
+
+        g_createDeviceHooked.store(false);
+        g_createDeviceVTableEntry = nullptr;
+        g_savedCreateDevicePtr = nullptr;
+    }
+
+    // Unhook Present
     if (g_vtableHooked.load() && g_patchedVTableEntry && g_savedOriginalPtr)
     {
         void** slot = g_patchedVTableEntry;
         void** vtable = slot - 17; // reverse offset
 
         if (UnmakeVTableHook(vtable, 17, g_savedOriginalPtr))
-            asi_log::Log("UnhookPresent: vtable slot restored\n");
+            asi_log::Log("UnhookPresent: Present vtable slot restored\n");
         else
-            asi_log::Log("UnhookPresent: Failed to restore vtable slot\n");
+            asi_log::Log("UnhookPresent: Failed to restore Present vtable slot\n");
 
         g_vtableHooked.store(false);
         g_patchedVTableEntry = nullptr;
@@ -144,6 +222,7 @@ void UnhookPresent()
     }
 
     g_originalPresent = nullptr;
+    g_originalCreateDevice = nullptr;
 }
 
 // Updated DllMain to clean up on detach
