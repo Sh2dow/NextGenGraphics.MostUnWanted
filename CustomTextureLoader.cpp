@@ -1,6 +1,7 @@
 #include "stdafx.h"
 #include "CustomTextureLoader.h"
-#include "GameTextureHashes.h"  // Auto-generated hash validation
+#include "GameTextureHashes.h"  // Auto-generated hash validation (vanilla Carbon TRACKS)
+#include "W2CTextureHashes.h"   // Auto-generated hash validation (W2C mod TRACKS)
 #include <filesystem>
 #include <string>
 #include <string_view>
@@ -221,8 +222,66 @@ namespace ngg
         // IOCP workers will read from this pointer
         IDirect3DDevice9* volatile g_d3dDevice = nullptr;
 
+        // W2C (World to Carbon) mod detection
+        // If hyperlinked.asi is found, use W2C hashmap instead of vanilla Carbon hashmap
+        std::atomic<bool> g_isW2CMod{false};
+        std::atomic<bool> g_w2cDetectionDone{false};
+
         // Forward declaration
         void BuildSwapTable();
+
+        // Detect if W2C (World to Carbon) mod is installed by checking for hyperlinked.asi
+        inline bool DetectW2CMod()
+        {
+            if (g_w2cDetectionDone.load())
+                return g_isW2CMod.load();
+
+            try
+            {
+                fs::path gameDir = fs::current_path();
+                fs::path hyperlinkedPath = gameDir / "scripts" / "hyperlinked.asi";
+
+                bool exists = fs::exists(hyperlinkedPath);
+                g_isW2CMod.store(exists);
+                g_w2cDetectionDone.store(true);
+
+                if (exists)
+                {
+                    asi_log::Log("CustomTextureLoader: W2C (World to Carbon) mod detected - using W2C texture hashmap (%zu textures)",
+                               TOTAL_W2C_TEXTURES);
+                }
+                else
+                {
+                    asi_log::Log("CustomTextureLoader: Vanilla Carbon detected - using default texture hashmap (%zu textures)",
+                               TOTAL_GAME_TEXTURES);
+                }
+
+                return exists;
+            }
+            catch (...)
+            {
+                g_isW2CMod.store(false);
+                g_w2cDetectionDone.store(true);
+                return false;
+            }
+        }
+
+        // Unified hash validation function - uses appropriate hashmap based on W2C detection
+        inline bool ValidateTextureHash(uint32_t hash)
+        {
+            DetectW2CMod(); // Ensure detection has run
+
+            if (g_isW2CMod.load())
+            {
+                // Use W2C hashmap
+                return IsValidW2CTextureHash(hash);
+            }
+            else
+            {
+                // Use vanilla Carbon hashmap
+                return ngg::carbon::IsValidGameTextureHash(hash);
+            }
+        }
 
         // Game's memory allocator functions (from NFSC SDK / NFSCBulbToys)
         // These are faster and more compatible than C++ new/delete
@@ -1121,7 +1180,7 @@ namespace ngg
                 }
 
                 // Skip if not a valid game texture hash
-                if (!IsValidGameTextureHash(hash))
+                if (!ValidateTextureHash(hash))
                 {
                     invalidHashes++;
                     continue;
