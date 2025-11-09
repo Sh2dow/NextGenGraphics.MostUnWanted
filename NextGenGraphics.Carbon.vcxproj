@@ -1,31 +1,31 @@
 <?xml version="1.0" encoding="utf-8"?>
 <Project DefaultTargets="Build" ToolsVersion="15.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
     <ItemGroup Label="ProjectConfigurations">
-        <ProjectConfiguration Include="Debug_MW|Win32">
-            <Configuration>Debug_MW</Configuration>
+        <ProjectConfiguration Include="Debug_NFSC|Win32">
+            <Configuration>Debug_NFSC</Configuration>
             <Platform>Win32</Platform>
         </ProjectConfiguration>
-        <ProjectConfiguration Include="Release_MW|Win32">
-            <Configuration>Release_MW</Configuration>
+        <ProjectConfiguration Include="Release_NFSC|Win32">
+            <Configuration>Release_NFSC</Configuration>
             <Platform>Win32</Platform>
         </ProjectConfiguration>
     </ItemGroup>
     <PropertyGroup Label="Globals">
         <ProjectGuid>{e8e260a3-65fb-48b9-a739-ca47eaf9603e}</ProjectGuid>
         <Keyword>Win32Proj</Keyword>
-        <RootNamespace>NextGenGraphics.MostWanted</RootNamespace>
-        <ProjectName>NextGenGraphics.MostWanted</ProjectName>
+        <RootNamespace>NextGenGraphics.Carbon</RootNamespace>
+        <ProjectName>NextGenGraphics.Carbon</ProjectName>
         <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
         <PlatformToolset>v143</PlatformToolset>
     </PropertyGroup>
     <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props"/>
 
-    <PropertyGroup Label="Configuration" Condition="'$(Configuration)|$(Platform)'=='Debug_MW|Win32' Or '$(Configuration)|$(Platform)'=='Debug_UG2|Win32' Or '$(Configuration)|$(Platform)'=='Debug_UG|Win32' Or '$(Configuration)|$(Platform)'=='Debug_Carbon|Win32' Or '$(Configuration)|$(Platform)'=='Debug_PS|Win32' Or '$(Configuration)|$(Platform)'=='Debug_UC|Win32'">
+    <PropertyGroup Label="Configuration" Condition="'$(Configuration)|$(Platform)'=='Debug_NFSC|Win32' Or '$(Configuration)|$(Platform)'=='Debug_UG2|Win32' Or '$(Configuration)|$(Platform)'=='Debug_UG|Win32' Or '$(Configuration)|$(Platform)'=='Debug_Carbon|Win32' Or '$(Configuration)|$(Platform)'=='Debug_PS|Win32' Or '$(Configuration)|$(Platform)'=='Debug_UC|Win32'">
         <ConfigurationType>DynamicLibrary</ConfigurationType>
         <UseDebugLibraries>true</UseDebugLibraries>
         <CharacterSet>Unicode</CharacterSet>
     </PropertyGroup>
-    <PropertyGroup Label="Configuration" Condition="'$(Configuration)|$(Platform)'=='Release_MW|Win32'">
+    <PropertyGroup Label="Configuration" Condition="'$(Configuration)|$(Platform)'=='Release_NFSC|Win32'">
         <ConfigurationType>DynamicLibrary</ConfigurationType>
         <UseDebugLibraries>false</UseDebugLibraries>
         <CharacterSet>Unicode</CharacterSet>
@@ -37,19 +37,19 @@
         <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform"/>
     </ImportGroup>
     <PropertyGroup Label="UserMacros"/>
-    <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug_MW|Win32' Or '$(Configuration)|$(Platform)'=='Debug_UG2|Win32' Or '$(Configuration)|$(Platform)'=='Debug_UG|Win32' Or '$(Configuration)|$(Platform)'=='Debug_Carbon|Win32' Or '$(Configuration)|$(Platform)'=='Debug_PS|Win32' Or '$(Configuration)|$(Platform)'=='Debug_UC|Win32'">
+    <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug_NFSC|Win32' Or '$(Configuration)|$(Platform)'=='Debug_UG2|Win32' Or '$(Configuration)|$(Platform)'=='Debug_UG|Win32' Or '$(Configuration)|$(Platform)'=='Debug_Carbon|Win32' Or '$(Configuration)|$(Platform)'=='Debug_PS|Win32' Or '$(Configuration)|$(Platform)'=='Debug_UC|Win32'">
         <LinkIncremental>true</LinkIncremental>
         <TargetExt>.asi</TargetExt>
         <OutDir>$(SolutionDir)\bin\scripts\</OutDir>
-        <IntDir>obj\Win32\$(Configuration)\NextGenGraphics.MostWanted\</IntDir>
+        <IntDir>obj\Win32\$(Configuration)\NextGenGraphics.Carbon\</IntDir>
         <TargetName>$(ProjectName)</TargetName>
     </PropertyGroup>
-    <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release_MW|Win32' Or '$(Configuration)|$(Platform)'=='Release_UG2|Win32' Or '$(Configuration)|$(Platform)'=='Release_UG|Win32' Or '$(Configuration)|$(Platform)'=='Release_Carbon|Win32' Or '$(Configuration)|$(Platform)'=='Release_PS|Win32' Or '$(Configuration)|$(Platform)'=='Release_UC|Win32'">
+    <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release_NFSC|Win32' Or '$(Configuration)|$(Platform)'=='Release_UG2|Win32' Or '$(Configuration)|$(Platform)'=='Release_UG|Win32' Or '$(Configuration)|$(Platform)'=='Release_Carbon|Win32' Or '$(Configuration)|$(Platform)'=='Release_PS|Win32' Or '$(Configuration)|$(Platform)'=='Release_UC|Win32'">
         <LinkIncremental>false</LinkIncremental>
         <WholeProgramOptimization>true</WholeProgramOptimization>
         <TargetExt>.asi</TargetExt>
         <OutDir>$(SolutionDir)\bin\scripts\</OutDir>
-        <IntDir>obj\Win32\$(Configuration)\NextGenGraphics.MostWanted\</IntDir>
+        <IntDir>obj\Win32\$(Configuration)\NextGenGraphics.Carbon\</IntDir>
         <TargetName>$(ProjectName)</TargetName>
     </PropertyGroup>
 
@@ -57,7 +57,7 @@
         <ClCompile>
             <LanguageStandard>stdcpp17</LanguageStandard>
             <AdditionalIncludeDirectories>
-                includes;includes\injector;includes\json\include;includes\spdlog\include;
+                includes;includes\json\include;includes\spdlog\include;
                 $(DXSDK_DIR)Include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
         </ClCompile>
         <Link>
@@ -66,18 +66,19 @@
             <AdditionalDependencies>d3d9.lib;d3dx9.lib;ws2_32.lib;%(AdditionalDependencies)</AdditionalDependencies>
         </Link>
     </ItemDefinitionGroup>
-    <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug_MW|Win32' Or '$(Configuration)|$(Platform)'=='Debug_UG2|Win32' Or '$(Configuration)|$(Platform)'=='Debug_UG|Win32' Or '$(Configuration)|$(Platform)'=='Debug_Carbon|Win32' Or '$(Configuration)|$(Platform)'=='Debug_PS|Win32' Or '$(Configuration)|$(Platform)'=='Debug_UC|Win32'">
+    <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug_NFSC|Win32' Or '$(Configuration)|$(Platform)'=='Debug_UG2|Win32' Or '$(Configuration)|$(Platform)'=='Debug_UG|Win32' Or '$(Configuration)|$(Platform)'=='Debug_Carbon|Win32' Or '$(Configuration)|$(Platform)'=='Debug_PS|Win32' Or '$(Configuration)|$(Platform)'=='Debug_UC|Win32'">
         <ClCompile>
             <PrecompiledHeader>NotUsing</PrecompiledHeader>
             <WarningLevel>Level3</WarningLevel>
             <Optimization>Disabled</Optimization>
             <PreprocessorDefinitions>WIN32;_DEBUG;_WINDOWS;_USRDLL;_CRT_SECURE_NO_WARNINGS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+            <RuntimeLibrary>MultiThreadedDebug</RuntimeLibrary>
         </ClCompile>
         <Link>
             <GenerateDebugInformation>true</GenerateDebugInformation>
         </Link>
     </ItemDefinitionGroup>
-    <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release_MW|Win32' Or '$(Configuration)|$(Platform)'=='Release_UG2|Win32' Or '$(Configuration)|$(Platform)'=='Release_UG|Win32' Or '$(Configuration)|$(Platform)'=='Release_Carbon|Win32' Or '$(Configuration)|$(Platform)'=='Release_PS|Win32' Or '$(Configuration)|$(Platform)'=='Release_UC|Win32'">
+    <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release_NFSC|Win32' Or '$(Configuration)|$(Platform)'=='Release_UG2|Win32' Or '$(Configuration)|$(Platform)'=='Release_UG|Win32' Or '$(Configuration)|$(Platform)'=='Release_Carbon|Win32' Or '$(Configuration)|$(Platform)'=='Release_PS|Win32' Or '$(Configuration)|$(Platform)'=='Release_UC|Win32'">
         <ClCompile>
             <PrecompiledHeader>NotUsing</PrecompiledHeader>
             <WarningLevel>Level4</WarningLevel>
@@ -85,6 +86,7 @@
             <PreprocessorDefinitions>WIN32;_RELEASE;_WINDOWS;_USRDLL;_CRT_SECURE_NO_WARNINGS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
             <FunctionLevelLinking>true</FunctionLevelLinking>
             <IntrinsicFunctions>true</IntrinsicFunctions>
+            <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
         </ClCompile>
         <Link>
             <GenerateDebugInformation>false</GenerateDebugInformation>
@@ -93,10 +95,10 @@
         </Link>
     </ItemDefinitionGroup>
 
-    <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug_MW|Win32' Or '$(Configuration)|$(Platform)'=='Release_MW|Win32'">
+    <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug_NFSC|Win32' Or '$(Configuration)|$(Platform)'=='Release_NFSC|Win32'">
         <PostBuildEvent>
             <Command>
-                start XCOPY /Y /R "$(TargetDir)*" "d:\Games\NFS MW - Vanilla\SCRIPTS\"
+                start XCOPY /Y /R "$(TargetDir)*" "d:\Games\NFSC - Test\SCRIPTS\"
             </Command>
         </PostBuildEvent>
     </ItemDefinitionGroup>
@@ -104,11 +106,27 @@
     <ItemGroup>
         <ClInclude Include="CustomTextureLoader.h"/>
         <ClInclude Include="features.h"/>
+        <ClInclude Include="GameTextureHashes.h" />
         <ClInclude Include="includes\IniReader.h" />
+        <ClInclude Include="includes\minhook\include\MinHook.h" />
+        <ClInclude Include="includes\minhook\src\buffer.h" />
+        <ClInclude Include="includes\minhook\src\hde\hde32.h" />
+        <ClInclude Include="includes\minhook\src\hde\hde64.h" />
+        <ClInclude Include="includes\minhook\src\hde\pstdint.h" />
+        <ClInclude Include="includes\minhook\src\hde\table32.h" />
+        <ClInclude Include="includes\minhook\src\hde\table64.h" />
+        <ClInclude Include="includes\minhook\src\trampoline.h" />
+        <ClInclude Include="NFSC_PreFEngHook.h" />
         <ClInclude Include="NFSMW_PreFEngHook.h" />
         <ClInclude Include="Log.h" />
+        <ClInclude Include="targetver.h" />
     </ItemGroup>
     <ItemGroup>
+        <ClCompile Include="includes\minhook\src\buffer.c" />
+        <ClCompile Include="includes\minhook\src\hde\hde32.c" />
+        <ClCompile Include="includes\minhook\src\hde\hde64.c" />
+        <ClCompile Include="includes\minhook\src\hook.c" />
+        <ClCompile Include="includes\minhook\src\trampoline.c" />
         <ClCompile Include="dllmain.cpp" />
         <ClCompile Include="stdafx.h"/>
         <ClCompile Include="CustomTextureLoader.cpp"/>

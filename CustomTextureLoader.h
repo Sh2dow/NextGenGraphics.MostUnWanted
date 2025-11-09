@@ -19,5 +19,12 @@ public:
 
     // Called from HookedPresent to provide the D3D device
     static void SetD3DDevice(IDirect3DDevice9* device);
+
+    // Called from HookedSetTexture to check for custom texture replacements
+    // Returns custom texture if available, nullptr otherwise
+    static IDirect3DBaseTexture9* OnSetTexture(IDirect3DBaseTexture9* gameTexture);
+
+    // Called from DllMain on DLL_PROCESS_DETACH to clean up
+    static void Cleanup();
 };
 

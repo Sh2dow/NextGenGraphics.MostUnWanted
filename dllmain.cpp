@@ -1,15 +1,14 @@
-// Minimal reimplementation of the NextGenGraphics.MostWanted plugin.
+// Minimal reimplementation of the NextGenGraphics.Carbon plugin.
 #include <windows.h>
 #include <vector>
 #include <memory>
 #include <atomic>
-#include "NFSMW_PreFEngHook.h"
-#include "WriteProtectScope.h"
+#include "NFSC_PreFEngHook.h"
 #include "features.h"
 #include "CustomTextureLoader.h"
-#include "Log.h"
+#include "WriteProtectScope.h"
 
-using namespace ngg::mw;
+using namespace ngg::carbon;
 
 // TODO: Port full initialization logic from sub_10077220
 static std::vector<std::unique_ptr<ngg::common::Feature>> g_features;
@@ -29,12 +28,19 @@ static std::atomic g_createDeviceHooked{false};
 static void** g_createDeviceVTableEntry = nullptr;
 static void* g_savedCreateDevicePtr = nullptr;
 
+// Original SetTexture function pointer
+typedef HRESULT (STDMETHODCALLTYPE*SetTextureFn)(IDirect3DDevice9*, DWORD, IDirect3DBaseTexture9*);
+SetTextureFn g_originalSetTexture = nullptr;
+static std::atomic g_setTextureHooked{false};
+static void** g_setTextureVTableEntry = nullptr;
+static void* g_savedSetTexturePtr = nullptr;
+
 bool triedInit = false;
 
 
 static void Initialize()
 {
-    using namespace ngg::mw::features;
+    using namespace ngg::carbon::features;
 
     g_features.emplace_back(std::make_unique<CustomTextureLoader>());
 
@@ -94,12 +100,70 @@ HRESULT APIENTRY HookedCreateDevice(
     return D3DERR_INVALIDCALL;
 }
 
+// Hooked SetTexture - intercepts all texture sets and swaps with custom textures
+HRESULT STDMETHODCALLTYPE HookedSetTexture(IDirect3DDevice9* device, DWORD stage, IDirect3DBaseTexture9* texture)
+{
+    // Debug: Track call count
+    static std::atomic<int> hookCallCount{0};
+    static bool loggedHookCallCount = false;
+
+    int currentCount = hookCallCount.fetch_add(1);
+    if (!loggedHookCallCount && currentCount >= 1)  // Log immediately on first call!
+    {
+        asi_log::Log("HookedSetTexture called %d times - HOOK IS WORKING!", currentCount);
+        loggedHookCallCount = true;
+    }
+
+    // Let CustomTextureLoader check if we have a custom replacement
+    IDirect3DBaseTexture9* replacementTexture = CustomTextureLoader::OnSetTexture(texture);
+
+    // Use replacement if available, otherwise use original
+    IDirect3DBaseTexture9* finalTexture = replacementTexture ? replacementTexture : texture;
+
+    // Call original SetTexture with potentially swapped texture
+    if (g_originalSetTexture)
+        return g_originalSetTexture(device, stage, finalTexture);
+
+    // Fallback: call through device's vtable
+    typedef HRESULT (STDMETHODCALLTYPE*SetTextureLocalFn)(IDirect3DDevice9*, DWORD, IDirect3DBaseTexture9*);
+    void** vtable = *reinterpret_cast<void***>(device);
+    SetTextureLocalFn setTextureFn = reinterpret_cast<SetTextureLocalFn>(vtable[65]);
+    if (setTextureFn && setTextureFn != &HookedSetTexture)
+        return setTextureFn(device, stage, finalTexture);
+
+    return D3D_OK;
+}
+
 // Hooked Present (unchanged behaviour)
 HRESULT APIENTRY HookedPresent(IDirect3DDevice9* device, CONST RECT* src, CONST RECT* dest, HWND wnd,
                                CONST RGNDATA* dirty)
 {
     OnPresent(); // trigger Initialize logic
     CustomTextureLoader::SetD3DDevice(device);
+
+    // Install SetTexture hook on first call (when we have the real game device)
+    if (!g_setTextureHooked.load() && device)
+    {
+        void** deviceVTable = *reinterpret_cast<void***>(device);
+        if (deviceVTable)
+        {
+            void* originalSetTexturePtr = deviceVTable[65];
+            g_originalSetTexture = reinterpret_cast<SetTextureFn>(originalSetTexturePtr);
+
+            asi_log::Log("HookedPresent: Attempting to hook SetTexture at vtable[65] = %p", originalSetTexturePtr);
+
+            if (MakeVTableHook(deviceVTable, 65, reinterpret_cast<void*>(&HookedSetTexture), &g_savedSetTexturePtr))
+            {
+                g_setTextureHooked.store(true);
+                g_setTextureVTableEntry = &deviceVTable[65];
+                asi_log::Log("HookedPresent: IDirect3DDevice9::SetTexture hooked successfully - vtable[65] now points to %p\n", deviceVTable[65]);
+            }
+            else
+            {
+                asi_log::Log("HookedPresent: Failed to hook IDirect3DDevice9::SetTexture\n");
+            }
+        }
+    }
 
     // Call the original Present if we have it; fallback safe behavior if not
     if (g_originalPresent)
@@ -181,6 +245,8 @@ void HookPresent()
         asi_log::Log("HookPresent: Failed to hook IDirect3DDevice9::Present\n");
     }
 
+    // NOTE: SetTexture hook is installed dynamically in HookedPresent() when we get the real game device
+
     // Clean up dummy objects
     dummyDevice->Release();
     d3d->Release();
@@ -221,8 +287,25 @@ void UnhookPresent()
         g_savedOriginalPtr = nullptr;
     }
 
+    // Unhook SetTexture
+    if (g_setTextureHooked.load() && g_setTextureVTableEntry && g_savedSetTexturePtr)
+    {
+        void** slot = g_setTextureVTableEntry;
+        void** vtable = slot - 65; // reverse offset
+
+        if (UnmakeVTableHook(vtable, 65, g_savedSetTexturePtr))
+            asi_log::Log("UnhookPresent: SetTexture vtable slot restored\n");
+        else
+            asi_log::Log("UnhookPresent: Failed to restore SetTexture vtable slot\n");
+
+        g_setTextureHooked.store(false);
+        g_setTextureVTableEntry = nullptr;
+        g_savedSetTexturePtr = nullptr;
+    }
+
     g_originalPresent = nullptr;
     g_originalCreateDevice = nullptr;
+    g_originalSetTexture = nullptr;
 }
 
 // Updated DllMain to clean up on detach
@@ -248,6 +331,9 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
         //
         // If we need to support runtime DLL unloading (hot reload), we would need
         // to add proper NULL checks and error handling in all disable() methods.
+
+        // Clean up CustomTextureLoader to prevent crashes during shutdown
+        CustomTextureLoader::Cleanup();
 
         // Unhook Present (this is safe because we control the vtable)
         UnhookPresent();

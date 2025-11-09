@@ -1,0 +1,21 @@
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio 17
+VisualStudioVersion = 17.4.33122.133
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{a71ae580-b04b-488a-ba9c-a8394e8f5782}") = "NextGenGraphics.Carbon", "NextGenGraphics.Carbon.vcxproj", "{e8e260a3-65fb-48b9-a739-ca47eaf9603e}"
+EndProject
+Global
+    GlobalSection(SolutionConfigurationPlatforms) = preSolution
+        Debug_NFSC|Win32 = Debug_NFSC|Win32
+        Release_NFSC|Win32 = Release_NFSC|Win32
+    EndGlobalSection
+    GlobalSection(ProjectConfigurationPlatforms) = postSolution
+        {e8e260a3-65fb-48b9-a739-ca47eaf9603e}.Debug_NFSC|Win32.ActiveCfg = Debug_NFSC|Win32
+        {e8e260a3-65fb-48b9-a739-ca47eaf9603e}.Debug_NFSC|Win32.Build.0 = Debug_NFSC|Win32
+        {e8e260a3-65fb-48b9-a739-ca47eaf9603e}.Release_NFSC|Win32.ActiveCfg = Release_NFSC|Win32
+        {e8e260a3-65fb-48b9-a739-ca47eaf9603e}.Release_NFSC|Win32.Build.0 = Release_NFSC|Win32
+    EndGlobalSection
+    GlobalSection(SolutionProperties) = preSolution
+        HideSolutionNode = FALSE
+    EndGlobalSection
+EndGlobal

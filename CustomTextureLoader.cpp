@@ -1,6 +1,6 @@
 #include "stdafx.h"
 #include "CustomTextureLoader.h"
-
+#include "GameTextureHashes.h"  // Auto-generated hash validation
 #include <filesystem>
 #include <string>
 #include <string_view>
@@ -10,28 +10,46 @@
 #include <mutex>
 #include <thread>
 #include <atomic>
-
 #include <windows.h>
 #include <d3dx9.h>
-#include "NFSMW_PreFEngHook.h"
+
+// Conditional compilation for MW vs Carbon
+#ifdef NFSC
+#include "NFSC_PreFEngHook.h"
+#else
+#include "NFSC_PreFEngHook.h"
+#endif
 
 #include "Log.h"
-#include "includes/injector/injector.hpp"
+#include "includes/minhook/include/MinHook.h"
 #include "includes/json/include/nlohmann/json.hpp"
 
 namespace fs = std::filesystem;
 using json = nlohmann::json;
 
 // ============================================================================
-// ORIGINAL ASI CUSTOMTEXTURELOADER RE-IMPLEMENTATION
+// CUSTOMTEXTURELOADER RE-IMPLEMENTATION FOR NFS MOST WANTED & CARBON
 // ============================================================================
 // CRITICAL DISCOVERY: Original ASI uses BACKGROUND THREAD for texture loading!
 //
+// HOOKING IMPLEMENTATION:
+// - Uses MinHook library for robust function hooking with trampolines
+// - MinHook provides automatic instruction boundary detection (HDE32/64)
+// - Trampolines allow calling original functions safely
+// - Better error handling and debugging compared to manual memory patching
+//
+// MOST WANTED HOOKS:
 // Hook 1 at 0x6C3A30: Parse JSON (sub_1005DD50)
 //                     Called ONLY when graphics settings change (NOT at startup!)
 //                     nullsub_33 is just a "retn" instruction - a placeholder
-// Hook 2 at 0x6C6C97: Swap textures every frame (sub_1005F060/sub_1005F070)
+// Hook 2 at 0x6C6C8D: Swap textures every frame (sub_1005F060/sub_1005F070)
 //                     Just swaps textures - NO loading (textures already loaded by background thread)
+//
+// CARBON HOOKS:
+// Hook 1 at 0x000000: NOT FOUND - Carbon may not have equivalent nullsub
+//                     Skipped for now - texture paths parsed at startup instead
+// Hook 2 at 0x55CFD0: TextureInfo::Get hook for texture swapping
+//                     Intercepts texture lookups and swaps D3D texture pointers
 //
 // Original ASI Architecture:
 // 1. Startup: Parse JSON -> build hash→path map (fast)
@@ -42,727 +60,1316 @@ using json = nlohmann::json;
 // 6. Result: Textures pop in gradually during gameplay!
 //
 // Our implementation:
-// - enable(): Parse JSON, start background thread
-// - Background thread: Load textures asynchronously
-// - Hook 1: Re-parse JSON when graphics settings change, restart background thread
+// - enable(): Initialize MinHook, install hooks, parse JSON, start background thread
+// - Background thread: Load textures asynchronously via IOCP
+// - Hook 1: Re-parse JSON when graphics settings change (MW only - Carbon skips this)
 // - Hook 2: Swap textures (only if loaded by background thread)
+//
+// CARBON-SPECIFIC NOTES:
+// - GAME_CONTEXT_PTR (0xAB0BA4) stores current effect* (shader pointer)
+// - Material API should work similarly to MW (same vtable offsets)
+// - Texture wrapper addresses are different (0x9EBxxx range vs MW's 0x982xxx)
 // ============================================================================
 
 
-namespace
+namespace ngg
 {
-    // Hash → file path mapping (built during Hook 1)
-    std::unordered_map<uint32_t, std::string> g_texturePathMap;
-
-    // Hash → loaded 2D texture mapping (populated by IOCP worker threads)
-    std::unordered_map<uint32_t, IDirect3DTexture9*> g_textureMap;
-
-    // Hash → loaded volume texture mapping (for 3D textures like LUTs)
-    std::unordered_map<uint32_t, IDirect3DVolumeTexture9*> g_volumeTextureMap;
-
-    // Mutex for thread-safe texture map access
-    std::mutex g_textureMutex;
-
-    // CRITICAL: D3DX functions might not be thread-safe even with D3DCREATE_MULTITHREADED!
-    // Serialize all D3DX calls to prevent heap corruption
-    std::mutex g_d3dxMutex;
-
-    bool g_pathsLoaded = false;
-    uint32_t g_swapCallCount = 0;
-    uint32_t g_swapSuccessCount = 0;
-
-    // Track which generic textures have been logged (one-time logging)
-    std::unordered_set<uint32_t> g_loggedGenericTextures;
-
-    // IOCP-based thread pool for asynchronous texture loading
-    HANDLE g_iocp = nullptr;
-    std::vector<std::thread> g_workerThreads;
-    std::atomic<bool> g_stopLoading{false};
-    std::atomic<int> g_texturesLoaded{0};
-    std::atomic<int> g_totalTexturesToLoad{0};
-
-    // Global device pointer storage (updated by SetD3DDevice on render thread)
-    // IOCP workers will read from this pointer
-    IDirect3DDevice9* volatile g_d3dDevice = nullptr;
-
-    // Texture loading request structure (posted to IOCP queue)
-    struct TextureLoadRequest
+    namespace carbon
     {
-        uint32_t hash;
-        std::string path;
-        IDirect3DDevice9** ppDevice; // POINTER to device pointer (dereferenced at load time, not post time!)
-    };
+        // Hash → file path mapping (built during Hook 1)
+        std::unordered_map<uint32_t, std::string> g_texturePathMap;
 
-    // Optimization: Reserve capacity for expected texture count (1000-2000+)
-    constexpr size_t EXPECTED_TEXTURE_COUNT = 2000;
-    constexpr DWORD NUM_WORKER_THREADS = 4; // Number of IOCP worker threads
+        // Hash → loaded 2D texture mapping (populated by IOCP worker threads)
+        std::unordered_map<uint32_t, IDirect3DTexture9*> g_textureMap;
 
-    // Optimization: Track directory modification time to avoid re-parsing unchanged JSON
-    fs::file_time_type g_lastDirModTime;
+        // Hash → loaded volume texture mapping (for 3D textures like LUTs)
+        std::unordered_map<uint32_t, IDirect3DVolumeTexture9*> g_volumeTextureMap;
 
-    // bStringHash from game at 0x460BF0 (DJB hash variant)
-    constexpr uint32_t CalcHash(std::string_view str)
-    {
-        uint32_t hash = 0xFFFFFFFFu;
-        for (unsigned char c : str)
-            hash = hash * 33u + c;
-        return hash;
-    }
+        // CARBON-SPECIFIC: Texture replacement via TextureInfo::Get hook
+        //
+        // CRITICAL DISCOVERY from ExtendedCustomization SDK:
+        // - TextureInfo::Get(hash, defaultIfNotFound, includeUnloaded) at 0x55CFD0
+        // - TextureInfo has TextureInfoPlatInfo* PlatInfo member
+        // - TextureInfoPlatInfo has IDirect3DTexture9* pD3DTexture member
+        //
+        // Strategy: Hook TextureInfo::Get, call original, then swap pD3DTexture if we have custom texture
 
-    // Parse JSON and build hash→path map (FAST - no texture loading!)
-    // Matches original ASI behavior: sub_1005DD50 only parses JSON
-    void ParseTexturePaths()
-    {
-        try
+        // TextureInfo structures (from ExtendedCustomization SDK)
+        struct RenderState
         {
-            fs::path gameDir = fs::current_path();
+            unsigned int z_write_enabled : 1;
+            unsigned int is_backface_culled : 1;
+            unsigned int alpha_test_enabled : 1;
+            unsigned int alpha_blend_enabled : 1;
+            unsigned int alpha_blend_src : 4;
+            unsigned int alpha_blend_dest : 4;
+            unsigned int texture_address_u : 2;
+            unsigned int texture_address_v : 2;
+            unsigned int has_texture_animation : 1;
+            unsigned int is_additive_blend : 1;
+            unsigned int wants_auxiliary_textures : 1;
+            unsigned int bias_level : 2;
+            unsigned int multi_pass_blend : 1;
+            unsigned int colour_write_alpha : 1;
+            unsigned int sub_sort_key : 1;
+            unsigned int alpha_test_ref : 4;
+            unsigned int padding : 4;
+        };
 
-            // Optimization: Skip re-parsing if already parsed
-            if (g_pathsLoaded)
-                return;
+        struct TextureInfoPlatInfo
+        {
+            void* pNext;                        // +0x00: bNode next pointer
+            void* pPrev;                        // +0x04: bNode prev pointer
+            RenderState state;                  // +0x08: Render state
+            int type;                           // +0x0C: Type
+            IDirect3DTexture9* pD3DTexture;     // +0x10: D3D texture pointer (THIS IS WHAT WE SWAP!)
+            unsigned short punchthruValue;      // +0x14: Punchthru value
+            unsigned short format;              // +0x16: Format
+        };
 
-            asi_log::Log("CustomTextureLoader: Parsing texture paths...");
+        struct TextureInfo
+        {
+            TextureInfoPlatInfo* PlatInfo;      // +0x00: Platform info pointer
+            void* pNext;                        // +0x04: bNode next pointer
+            void* pPrev;                        // +0x08: bNode prev pointer
+            uint32_t key;                       // +0x0C: Texture hash
+            // ... rest of structure not needed for our purposes
+        };
 
-            // Optimization: Reserve capacity for expected texture count
-            g_texturePathMap.reserve(EXPECTED_TEXTURE_COUNT);
+        // Carbon's texture::info structure (from ExtendedCustomization/TextureInfo.h)
+        struct platform_info
+        {
+            uint32_t state;           // +0x00: render_state
+            uint32_t type;            // +0x04: type
+            IDirect3DTexture9* texture; // +0x08: D3D texture pointer
+            uint16_t punchthru_value; // +0x0C: punchthru_value
+            uint16_t format;          // +0x0E: format
+        };
 
-            int totalPaths = 0;
-            int skippedMissing = 0;
+        struct texture_info
+        {
+            platform_info* pinfo;     // +0x00: Pointer to platform_info
+            void* next;               // +0x04: linked_node next
+            void* prev;               // +0x08: linked_node prev
+            uint32_t key;             // +0x0C: Hash
+            // ... rest of structure (we don't need to fill it all)
+        };
 
-            // 1. Parse generic/global textures (water, noise, etc.)
-            fs::path genericDir = gameDir / "NextGenGraphics" / "GenericTextures";
-            if (fs::exists(genericDir))
+
+
+        // Mutex for thread-safe texture map access
+        std::mutex g_textureMutex;
+
+        // CRITICAL: D3DX functions might not be thread-safe even with D3DCREATE_MULTITHREADED!
+        // Serialize all D3DX calls to prevent heap corruption
+        std::mutex g_d3dxMutex;
+
+        // TextureInfo::Get function (0x0055CFD0)
+        // Signature: TextureInfo* __cdecl Get(uint32_t hash, bool defaultIfNotFound, bool includeUnloaded)
+        typedef TextureInfo* (__cdecl *GetTextureInfoFn)(uint32_t hash, bool defaultIfNotFound, bool includeUnloaded);
+
+        // MinHook trampoline to call original GetTextureInfo function
+        GetTextureInfoFn g_gameGetTextureInfo = nullptr;
+
+        // MinHook trampoline for HookLoad (if HOOK_LOAD_ADDR is available)
+        typedef void (__cdecl *HookLoadFn)();
+        HookLoadFn g_originalHookLoad = nullptr;
+
+        bool g_pathsLoaded = false;
+        uint32_t g_swapCallCount = 0;
+        uint32_t g_swapSuccessCount = 0;
+
+        // Track which generic textures have been logged (one-time logging)
+        std::unordered_set<uint32_t> g_loggedGenericTextures;
+
+        // IOCP-based thread pool for asynchronous texture loading
+        HANDLE g_iocp = nullptr;
+        std::vector<std::thread> g_workerThreads;
+        std::atomic<bool> g_stopLoading{false};
+        std::atomic<int> g_texturesLoaded{0};
+        std::atomic<int> g_totalTexturesToLoad{0};
+        std::atomic<bool> g_iocpStarted{false}; // Prevent duplicate StartIOCPLoading calls
+
+        // Global device pointer storage (updated by SetD3DDevice on render thread)
+        // IOCP workers will read from this pointer
+        IDirect3DDevice9* volatile g_d3dDevice = nullptr;
+
+        // Game's memory allocator functions (from NFSC SDK / NFSCBulbToys)
+        // These are faster and more compatible than C++ new/delete
+        inline void* GameMalloc(size_t size)
+        {
+            return reinterpret_cast<void*(__cdecl*)(size_t)>(0x6A1560)(size);
+        }
+
+        inline void GameFree(void* ptr)
+        {
+            reinterpret_cast<void(__cdecl*)(void*)>(0x6A1590)(ptr);
+        }
+
+        // FastMem allocator (pool allocator for small objects)
+        // NOTE: We don't know if there's a FastMem free function, so we use game malloc/free instead
+        // FastMem is likely a frame/level allocator that's cleared in bulk, not suitable for IOCP requests
+        inline void* FastMemAlloc(size_t size, const char* debug_name = nullptr)
+        {
+            return reinterpret_cast<void*(__thiscall*)(uintptr_t, size_t, const char*)>(0x60BA70)(0xA99720, size, debug_name);
+        }
+
+        // Texture loading request structure (posted to IOCP queue)
+        // NOTE: We use game malloc/free for these instead of C++ new/delete
+        // This avoids CRT heap fragmentation and is more compatible with game's memory management
+        struct TextureLoadRequest
+        {
+            uint32_t hash;
+            std::string path;
+            IDirect3DDevice9** ppDevice; // POINTER to device pointer (dereferenced at load time, not post time!)
+
+            // Custom allocator using game's malloc
+            static void* operator new(size_t size)
             {
-                for (const auto& entry : fs::directory_iterator(genericDir))
-                {
-                    if (!entry.is_regular_file())
-                        continue;
-
-                    std::string filename = entry.path().stem().string(); // Without extension
-                    uint32_t hash = CalcHash(filename);
-                    std::string fullPath = entry.path().string();
-
-                    g_texturePathMap[hash] = fullPath;
-                    totalPaths++;
-                }
+                return GameMalloc(size);
             }
 
-            // 2. Parse texture packs (custom textures)
-            fs::path texturePacksDir = gameDir / "NextGenGraphics" / "TexturePacks";
-            if (fs::exists(texturePacksDir))
+            static void operator delete(void* ptr)
             {
-                for (const auto& packEntry : fs::directory_iterator(texturePacksDir))
+                GameFree(ptr);
+            }
+        };
+
+        // Optimization: Reserve capacity for expected texture count (1000-2000+)
+        constexpr size_t EXPECTED_TEXTURE_COUNT = 2000;
+        constexpr DWORD NUM_WORKER_THREADS = 4; // Number of IOCP worker threads
+
+        // Optimization: Track directory modification time to avoid re-parsing unchanged JSON
+        fs::file_time_type g_lastDirModTime;
+
+        // bStringHash from game at 0x460BF0 (DJB hash variant)
+        constexpr uint32_t CalcHash(std::string_view str)
+        {
+            uint32_t hash = 0xFFFFFFFFu;
+            for (unsigned char c : str)
+                hash = hash * 33u + c;
+            return hash;
+        }
+
+        // Parse JSON and build hash→path map (FAST - no texture loading!)
+        // Matches original ASI behavior: sub_1005DD50 only parses JSON
+        void ParseTexturePaths()
+        {
+            try
+            {
+                fs::path gameDir = fs::current_path();
+
+                // Optimization: Skip re-parsing if already parsed
+                if (g_pathsLoaded)
+                    return;
+
+                asi_log::Log("CustomTextureLoader: Parsing texture paths...");
+
+                // Optimization: Reserve capacity for expected texture count
+                g_texturePathMap.reserve(EXPECTED_TEXTURE_COUNT);
+
+                int totalPaths = 0;
+                int skippedMissing = 0;
+
+                // 1. Parse generic/global textures (water, noise, etc.)
+                fs::path genericDir = gameDir / "NextGenGraphics" / "GenericTextures";
+                if (fs::exists(genericDir))
                 {
-                    if (!packEntry.is_directory())
-                        continue;
-
-                    fs::path jsonPath = packEntry.path() / "TexturePackInfo.json";
-                    if (!fs::exists(jsonPath))
-                        continue;
-
-                    // Parse JSON
-                    std::ifstream jsonFile(jsonPath);
-                    json packInfo = json::parse(jsonFile);
-
-                    std::string rootDir = packInfo["rootDirectory"];
-                    fs::path texturesDir = packEntry.path() / rootDir;
-
-                    // Build hash→path map from JSON (NO texture loading!)
-                    for (const auto& mapping : packInfo["textureMappings"])
+                    for (const auto& entry : fs::directory_iterator(genericDir))
                     {
-                        std::string gameId = mapping["gameId"];
-                        std::string texturePath = mapping["texturePath"];
-
-                        uint32_t hash = CalcHash(gameId);
-                        fs::path fullPath = texturesDir / texturePath;
-
-                        // Skip missing files (don't add to map)
-                        if (!fs::exists(fullPath))
-                        {
-                            skippedMissing++;
+                        if (!entry.is_regular_file())
                             continue;
-                        }
 
-                        g_texturePathMap[hash] = fullPath.string();
+                        std::string filename = entry.path().stem().string(); // Without extension
+                        uint32_t hash = CalcHash(filename);
+                        std::string fullPath = entry.path().string();
+
+                        g_texturePathMap[hash] = fullPath;
                         totalPaths++;
                     }
                 }
+
+                // 2. Parse texture packs (custom textures)
+                fs::path texturePacksDir = gameDir / "NextGenGraphics" / "TexturePacks";
+                if (fs::exists(texturePacksDir))
+                {
+                    for (const auto& packEntry : fs::directory_iterator(texturePacksDir))
+                    {
+                        if (!packEntry.is_directory())
+                            continue;
+
+                        fs::path jsonPath = packEntry.path() / "TexturePackInfo.json";
+                        if (!fs::exists(jsonPath))
+                            continue;
+
+                        // Parse JSON
+                        std::ifstream jsonFile(jsonPath);
+                        json packInfo = json::parse(jsonFile);
+
+                        std::string rootDir = packInfo["rootDirectory"];
+                        fs::path texturesDir = packEntry.path() / rootDir;
+
+                        // Build hash→path map from JSON (NO texture loading!)
+                        for (const auto& mapping : packInfo["textureMappings"])
+                        {
+                            std::string gameId = mapping["gameId"];
+                            std::string texturePath = mapping["texturePath"];
+
+                            uint32_t hash = CalcHash(gameId);
+                            fs::path fullPath = texturesDir / texturePath;
+
+                            // Skip missing files (don't add to map)
+                            if (!fs::exists(fullPath))
+                            {
+                                skippedMissing++;
+                                continue;
+                            }
+
+                            g_texturePathMap[hash] = fullPath.string();
+                            totalPaths++;
+                        }
+                    }
+                }
+
+                asi_log::Log("CustomTextureLoader: Parsed %d texture paths (%d missing files skipped)",
+                             totalPaths, skippedMissing);
+                g_pathsLoaded = true;
+            }
+            catch (const std::exception& e)
+            {
+                asi_log::Log("CustomTextureLoader: Error parsing texture paths: %s", e.what());
+            }
+        }
+
+        // Lookup texture (called from Hook 2)
+        // Returns texture if loaded by background thread, NULL otherwise
+        IDirect3DTexture9* GetTexture(uint32_t hash)
+        {
+            if (hash == 0)
+                return nullptr;
+
+            std::lock_guard<std::mutex> lock(g_textureMutex);
+
+            // Just lookup in map - NO on-demand loading!
+            auto it = g_textureMap.find(hash);
+            if (it != g_textureMap.end())
+            {
+                IDirect3DTexture9* texture = it->second;
+                // DON'T call AddRef() - the game doesn't expect it!
+                // The texture is already owned by us (stored in the map)
+                // The game will just use it, not take ownership
+                return texture;
             }
 
-            asi_log::Log("CustomTextureLoader: Parsed %d texture paths (%d missing files skipped)",
-                         totalPaths, skippedMissing);
-            g_pathsLoaded = true;
-        }
-        catch (const std::exception& e)
-        {
-            asi_log::Log("CustomTextureLoader: Error parsing texture paths: %s", e.what());
-        }
-    }
-
-    // Lookup texture (called from Hook 2)
-    // Returns texture if loaded by background thread, NULL otherwise
-    IDirect3DTexture9* GetTexture(uint32_t hash)
-    {
-        if (hash == 0)
-            return nullptr;
-
-        std::lock_guard<std::mutex> lock(g_textureMutex);
-
-        // Just lookup in map - NO on-demand loading!
-        auto it = g_textureMap.find(hash);
-        if (it != g_textureMap.end())
-        {
-            IDirect3DTexture9* texture = it->second;
-            // DON'T call AddRef() - the game doesn't expect it!
-            // The texture is already owned by us (stored in the map)
-            // The game will just use it, not take ownership
-            return texture;
+            return nullptr; // Not loaded yet by background thread
         }
 
-        return nullptr; // Not loaded yet by background thread
-    }
-
-    // Load volume texture on-demand (called from Hook 2)
-    // NOTE: Volume textures are loaded synchronously on first use (not via IOCP)
-    // because they're rare (only LUTs) and need to be available immediately
-    IDirect3DVolumeTexture9* GetVolumeTexture(uint32_t hash, IDirect3DDevice9* device)
-    {
-        if (hash == 0 || !device)
-            return nullptr;
-
-        std::lock_guard<std::mutex> lock(g_textureMutex);
-
-        // Check if already loaded
-        auto it = g_volumeTextureMap.find(hash);
-        if (it != g_volumeTextureMap.end())
-            return it->second;
-
-        // Check if we have a path for this hash
-        auto pathIt = g_texturePathMap.find(hash);
-        if (pathIt == g_texturePathMap.end())
-            return nullptr;
-
-        // Load volume texture on-demand
-        IDirect3DVolumeTexture9* volumeTexture = nullptr;
-        HRESULT hr = D3DXCreateVolumeTextureFromFileA(
-            device,
-            pathIt->second.c_str(),
-            &volumeTexture
-        );
-
-        if (SUCCEEDED(hr) && volumeTexture)
+        // Load volume texture on-demand (called from Hook 2)
+        // NOTE: Volume textures are loaded synchronously on first use (not via IOCP)
+        // because they're rare (only LUTs) and need to be available immediately
+        IDirect3DVolumeTexture9* GetVolumeTexture(uint32_t hash, IDirect3DDevice9* device)
         {
-            // Cache the loaded texture
-            g_volumeTextureMap[hash] = volumeTexture;
-            return volumeTexture;
-        }
+            if (hash == 0 || !device)
+                return nullptr;
 
-        // Failed to load - remove from path map to avoid retrying
-        g_texturePathMap.erase(pathIt);
-        return nullptr;
-    }
+            std::lock_guard<std::mutex> lock(g_textureMutex);
 
-    // IOCP worker thread function - processes texture loading requests
-    // Matches original ASI behavior: uses IOCP thread pool for asynchronous loading
-    void IOCPWorkerThread()
-    {
-        while (!g_stopLoading.load())
-        {
-            DWORD bytesTransferred = 0;
-            ULONG_PTR completionKey = 0;
-            LPOVERLAPPED overlapped = nullptr;
+            // Check if already loaded
+            auto it = g_volumeTextureMap.find(hash);
+            if (it != g_volumeTextureMap.end())
+                return it->second;
 
-            // Wait for work item from IOCP queue (500ms timeout)
-            BOOL result = GetQueuedCompletionStatus(
-                g_iocp,
-                &bytesTransferred,
-                &completionKey,
-                &overlapped,
-                500 // 500ms timeout
+            // Check if we have a path for this hash
+            auto pathIt = g_texturePathMap.find(hash);
+            if (pathIt == g_texturePathMap.end())
+                return nullptr;
+
+            // Load volume texture on-demand
+            IDirect3DVolumeTexture9* volumeTexture = nullptr;
+            HRESULT hr = D3DXCreateVolumeTextureFromFileA(
+                device,
+                pathIt->second.c_str(),
+                &volumeTexture
             );
 
-            // Check for shutdown signal
-            if (!result && overlapped == nullptr)
+            if (SUCCEEDED(hr) && volumeTexture)
             {
-                // Timeout or error - check if we should stop
-                if (g_stopLoading.load())
-                    break;
-                continue;
+                // Cache the loaded texture
+                g_volumeTextureMap[hash] = volumeTexture;
+                return volumeTexture;
             }
 
-            // Shutdown signal (completionKey == 0)
-            if (completionKey == 0)
-                break;
+            // Failed to load - remove from path map to avoid retrying
+            g_texturePathMap.erase(pathIt);
+            return nullptr;
+        }
 
-            // Process texture loading request
-            TextureLoadRequest* request = reinterpret_cast<TextureLoadRequest*>(completionKey);
-            if (request)
+        // IOCP worker thread function - processes texture loading requests
+        // Matches original ASI behavior: uses IOCP thread pool for asynchronous loading
+        void IOCPWorkerThread()
+        {
+            while (!g_stopLoading.load())
             {
-                // CRITICAL: Dereference the device pointer AT LOAD TIME, not at post time!
-                // This matches the original ASI's approach - always get the CURRENT device pointer
-                IDirect3DDevice9** ppDevice = request->ppDevice;
-                if (!ppDevice)
+                DWORD bytesTransferred = 0;
+                ULONG_PTR completionKey = 0;
+                LPOVERLAPPED overlapped = nullptr;
+
+                // Wait for work item from IOCP queue (500ms timeout)
+                BOOL result = GetQueuedCompletionStatus(
+                    g_iocp,
+                    &bytesTransferred,
+                    &completionKey,
+                    &overlapped,
+                    500 // 500ms timeout
+                );
+
+                // Check for shutdown signal
+                if (!result && overlapped == nullptr)
                 {
-                    asi_log::Log(
-                        "CustomTextureLoader: ERROR - Device pointer-to-pointer is NULL! Skipping texture 0x%08X",
-                        request->hash);
-                    delete request;
+                    // Timeout or error - check if we should stop
+                    if (g_stopLoading.load())
+                        break;
                     continue;
                 }
 
-                IDirect3DDevice9* device = *ppDevice; // Dereference NOW to get current device
-                if (!device)
+                // Shutdown signal (completionKey == 0)
+                if (completionKey == 0)
+                    break;
+
+                // Process texture loading request
+                TextureLoadRequest* request = reinterpret_cast<TextureLoadRequest*>(completionKey);
+                if (request)
                 {
-                    asi_log::Log(
-                        "CustomTextureLoader: ERROR - Device pointer (*ppDevice) is NULL! Skipping texture 0x%08X",
-                        request->hash);
+                    // CRITICAL: Dereference the device pointer AT LOAD TIME, not at post time!
+                    // This matches the original ASI's approach - always get the CURRENT device pointer
+                    IDirect3DDevice9** ppDevice = request->ppDevice;
+                    if (!ppDevice)
+                    {
+                        asi_log::Log(
+                            "CustomTextureLoader: ERROR - Device pointer-to-pointer is NULL! Skipping texture 0x%08X",
+                            request->hash);
+                        delete request;
+                        continue;
+                    }
+
+                    IDirect3DDevice9* device = *ppDevice; // Dereference NOW to get current device
+                    if (!device)
+                    {
+                        asi_log::Log(
+                            "CustomTextureLoader: ERROR - Device pointer (*ppDevice) is NULL! Skipping texture 0x%08X",
+                            request->hash);
+                        delete request;
+                        continue;
+                    }
+
+                    // CRITICAL: AddRef the device to prevent it from being released while we use it!
+                    // This ensures the device stays valid even if the game releases it
+                    device->AddRef();
+
+                    // Load texture using device pointer from request
+                    // CRITICAL: D3DX functions are NOT thread-safe! Serialize all D3DX calls!
+                    IDirect3DTexture9* texture = nullptr;
+                    HRESULT hr;
+                    {
+                        std::lock_guard<std::mutex> d3dxLock(g_d3dxMutex);
+                        hr = D3DXCreateTextureFromFileA(
+                            device,
+                            request->path.c_str(),
+                            &texture
+                        );
+                    }
+
+                    // Release the device reference we added
+                    device->Release();
+
+                    if (SUCCEEDED(hr) && texture)
+                    {
+                        // CARBON: Store D3D texture in map for GetTextureInfo hook
+                        bool textureStored = false;
+                        {
+                            std::lock_guard<std::mutex> lock(g_textureMutex);
+
+                            // Check if already loaded (prevents memory leak from duplicate loads)
+                            auto it = g_textureMap.find(request->hash);
+                            if (it != g_textureMap.end())
+                            {
+                                // Already loaded - release the new texture and keep the old one
+                                texture->Release();
+                                asi_log::Log("CustomTextureLoader: WARNING - Duplicate load for hash 0x%08X, keeping existing texture", request->hash);
+                            }
+                            else
+                            {
+                                // First time loading this hash - store it
+                                g_textureMap[request->hash] = texture;
+                                textureStored = true;
+
+                                // Log first 20 loaded hashes
+                                static int logCount = 0;
+                                if (logCount < 20)
+                                {
+                                    asi_log::Log("CustomTextureLoader: Loaded texture hash=0x%08X, D3D texture=%p, path=%s",
+                                               request->hash, texture, request->path.c_str());
+                                    logCount++;
+                                }
+                            }
+                        }
+
+                        // Only increment counter if texture was actually stored (not a duplicate)
+                        if (textureStored)
+                        {
+                            int loaded = g_texturesLoaded.fetch_add(1) + 1;
+                            int total = g_totalTexturesToLoad.load();
+
+                            // Log progress every 100 textures OR when all textures are loaded
+                            if (loaded % 100 == 0 || loaded == total)
+                            {
+                                asi_log::Log("CustomTextureLoader: IOCP loading progress: %d/%d textures",
+                                             loaded, total);
+                            }
+
+                            // When all textures are loaded, log completion
+                            if (loaded == total)
+                            {
+                                asi_log::Log("CustomTextureLoader: All textures loaded - %d D3D textures ready", loaded);
+                                asi_log::Log("CustomTextureLoader: Custom texture map built - %d entries", g_textureMap.size());
+                                asi_log::Log("CustomTextureLoader: Textures will be swapped via TextureInfo::Get hook as you drive around the world");
+                            }
+                        }
+                    }
+                    else
+                    {
+                        // DON'T erase from g_texturePathMap - this changes the size and triggers reload loop!
+                        // Just log the error and continue
+                        asi_log::Log("CustomTextureLoader: ERROR - Failed to load texture hash=0x%08X, path=%s, HRESULT=0x%08X",
+                                   request->hash, request->path.c_str(), hr);
+                    }
+
+                    // Free the request
                     delete request;
-                    continue;
+                }
+            }
+        }
+
+        // Stop IOCP worker threads
+        void StopIOCPWorkers()
+        {
+            if (g_iocp)
+            {
+                g_stopLoading.store(true);
+
+                // Post shutdown signals to all worker threads
+                for (size_t i = 0; i < g_workerThreads.size(); i++)
+                {
+                    PostQueuedCompletionStatus(g_iocp, 0, 0, nullptr);
                 }
 
-                // CRITICAL: AddRef the device to prevent it from being released while we use it!
-                // This ensures the device stays valid even if the game releases it
-                device->AddRef();
-
-                // Load texture using device pointer from request
-                // CRITICAL: D3DX functions are NOT thread-safe! Serialize all D3DX calls!
-                IDirect3DTexture9* texture = nullptr;
-                HRESULT hr;
+                // Wait for all threads to finish
+                for (auto& thread : g_workerThreads)
                 {
-                    std::lock_guard<std::mutex> d3dxLock(g_d3dxMutex);
-                    hr = D3DXCreateTextureFromFileA(
-                        device,
-                        request->path.c_str(),
-                        &texture
-                    );
+                    if (thread.joinable())
+                        thread.join();
                 }
 
-                // Release the device reference we added
-                device->Release();
+                g_workerThreads.clear();
+                CloseHandle(g_iocp);
+                g_iocp = nullptr;
+                g_stopLoading.store(false);
+                g_iocpStarted.store(false); // Allow restart after stop
 
-                if (SUCCEEDED(hr) && texture)
+                // Release the device pointer we AddRef'd in StartIOCPLoading
+                if (g_d3dDevice)
                 {
-                    // Add to texture map (thread-safe)
-                    {
-                        std::lock_guard<std::mutex> lock(g_textureMutex);
-                        g_textureMap[request->hash] = texture;
-                    }
+                    g_d3dDevice->Release();
+                    g_d3dDevice = nullptr;
+                }
+            }
+        }
 
-                    int loaded = g_texturesLoaded.fetch_add(1) + 1;
-                    int total = g_totalTexturesToLoad.load();
+        // Start IOCP worker threads and post texture loading requests
+        void StartIOCPLoading(IDirect3DDevice9* device)
+        {
+            // Prevent duplicate calls (fixes texture reload loop bug)
+            if (g_iocpStarted.load())
+            {
+                asi_log::Log("CustomTextureLoader: IOCP loading already started, ignoring duplicate call");
+                return;
+            }
 
-                    // Log progress every 100 textures OR when all textures are loaded
-                    if (loaded % 100 == 0 || loaded == total)
-                    {
-                        asi_log::Log("CustomTextureLoader: IOCP loading progress: %d/%d textures",
-                                     loaded, total);
-                    }
+            // Stop any existing workers
+            StopIOCPWorkers();
+
+            if (!device)
+            {
+                asi_log::Log("CustomTextureLoader: Cannot start IOCP loading - device is NULL!");
+                return;
+            }
+
+            // Mark as started BEFORE posting requests (prevents race condition)
+            g_iocpStarted.store(true);
+
+            // Store device pointer globally for IOCP workers to access
+            // AddRef to keep it alive while workers are using it
+            device->AddRef();
+            g_d3dDevice = device;
+
+            // Reset counters
+            g_texturesLoaded.store(0);
+            g_totalTexturesToLoad.store(static_cast<int>(g_texturePathMap.size()));
+
+            if (g_totalTexturesToLoad.load() == 0)
+            {
+                asi_log::Log("CustomTextureLoader: No textures to load");
+                return;
+            }
+
+            // Create IOCP
+            g_iocp = CreateIoCompletionPort(INVALID_HANDLE_VALUE, nullptr, 0, NUM_WORKER_THREADS);
+            if (!g_iocp)
+            {
+                asi_log::Log("CustomTextureLoader: Failed to create IOCP!");
+                return;
+            }
+
+            // Start worker threads
+            for (DWORD i = 0; i < NUM_WORKER_THREADS; i++)
+            {
+                g_workerThreads.emplace_back(IOCPWorkerThread);
+            }
+
+            asi_log::Log("CustomTextureLoader: Started %d IOCP worker threads", NUM_WORKER_THREADS);
+
+            // Post texture loading requests to IOCP queue
+            int requestsPosted = 0;
+            for (const auto& [hash, path] : g_texturePathMap)
+            {
+                // CRITICAL: Pass POINTER to device pointer, not the device itself!
+                // This matches the original ASI - workers dereference at load time to get CURRENT device
+                // This prevents crashes if the device is released/reset between post and load
+                TextureLoadRequest* request = new TextureLoadRequest{
+                    hash, path, const_cast<IDirect3DDevice9**>(&g_d3dDevice)
+                };
+
+                // Post to IOCP queue
+                if (!PostQueuedCompletionStatus(g_iocp, 0, reinterpret_cast<ULONG_PTR>(request), nullptr))
+                {
+                    asi_log::Log("CustomTextureLoader: Failed to post request for hash 0x%08X", hash);
+                    delete request;
                 }
                 else
                 {
-                    // Remove failed path from map
-                    std::lock_guard<std::mutex> lock(g_textureMutex);
-                    g_texturePathMap.erase(request->hash);
+                    requestsPosted++;
+                }
+            }
+
+            asi_log::Log("CustomTextureLoader: Posted %d texture loading requests to IOCP queue", requestsPosted);
+        }
+
+        // Optimization: Helper function to set material texture (reduces code duplication)
+        // CRITICAL: texPtrStorage must point to STATIC or GLOBAL storage that persists!
+        // The game stores the ADDRESS of the texture pointer, not the value!
+        // addRefTexture: Whether to call AddRef() on the texture (only for custom textures, not game's original)
+        bool SetMaterialTexture(void* material, const char* paramName, IDirect3DTexture9* texture,
+                                IDirect3DTexture9** texPtrStorage, bool addRefTexture)
+        {
+            if (!material)
+                return false;
+
+            // CRITICAL: Don't pass NULL textures to the game!
+            if (!texture)
+                return false;
+
+            // CRITICAL: Only AddRef custom textures, NOT the game's original textures!
+            // The game already owns its own textures and manages their lifetime.
+            // But our custom textures need an extra reference because the game will Release() them.
+            if (addRefTexture)
+                texture->AddRef();
+
+            // Store texture in the provided static storage
+            *texPtrStorage = texture;
+
+            // Get material vtable
+            void** vtable = *reinterpret_cast<void***>(material);
+            void* getParameterFn = *reinterpret_cast<void**>(reinterpret_cast<char*>(vtable) + 0x28);
+            void* setValueFn = *reinterpret_cast<void**>(reinterpret_cast<char*>(vtable) + 0x50);
+
+            void* param = nullptr;
+
+            // Call GetParameter - custom calling convention:
+            // Material pointer is in ECX AND pushed on stack
+            // Original ASI: mov ecx, material; push "DiffuseMap"; push 0; push ecx; call
+            __asm {
+                mov ecx, material
+                push paramName
+                push 0
+                push ecx
+                mov eax, material
+                mov eax, [eax]
+                call dword ptr [eax + 0x28]
+                mov param, eax
                 }
 
-                // Free the request
-                delete request;
-            }
-        }
-    }
-
-    // Stop IOCP worker threads
-    void StopIOCPWorkers()
-    {
-        if (g_iocp)
-        {
-            g_stopLoading.store(true);
-
-            // Post shutdown signals to all worker threads
-            for (size_t i = 0; i < g_workerThreads.size(); i++)
+            if (!param)
             {
-                PostQueuedCompletionStatus(g_iocp, 0, 0, nullptr);
+                // Failed to get parameter - release the texture if we AddRef'd it
+                if (addRefTexture)
+                    texture->Release();
+                return false;
             }
 
-            // Wait for all threads to finish
-            for (auto& thread : g_workerThreads)
+            // Call SetValue - custom calling convention:
+            // Material pointer is in ECX AND pushed on stack
+            // Original ASI: mov ecx, material; push 4; push &texture; push param; push ecx; call
+            // CRITICAL: Pass the address of the STATIC storage, not a local variable!
+            __asm {
+                mov ecx, material
+                mov eax, texPtrStorage
+                push 4
+                push eax
+                push param
+                push ecx
+                mov edx, material
+                mov edx, [edx]
+                call dword ptr [edx + 0x50]
+                }
+
+            return true;
+        }
+
+        // CARBON-SPECIFIC: Build reverse map from game textures to hashes
+        // Scans texture::loaded_table to map D3D texture pointers to their hashes
+        void BuildGameTextureMap()
+        {
+            asi_log::Log("CustomTextureLoader: BuildGameTextureMap() - Scanning texture::loaded_table...");
+
+            __try
             {
-                if (thread.joinable())
-                    thread.join();
+                // texture::loaded_table is at 0x00A921B0
+                // It's a loader::table structure which is a linked list of texture::info nodes
+
+                // Structure layout (from hyperlinked project):
+                // struct loader::table {
+                //     linked_node<texture::info>* head;  // +0x00
+                //     linked_node<texture::info>* tail;  // +0x04
+                //     uint32_t count;                    // +0x08
+                // };
+
+                struct LoaderTable {
+                    void* head;
+                    void* tail;
+                    uint32_t count;
+                };
+
+                LoaderTable* table = reinterpret_cast<LoaderTable*>(0x00A921B0);
+
+                if (!table || !table->head)
+                {
+                    asi_log::Log("CustomTextureLoader: BuildGameTextureMap() - Table is NULL or empty!");
+                    return;
+                }
+
+                asi_log::Log("CustomTextureLoader: BuildGameTextureMap() - Found %d textures in table", table->count);
+
+                // Iterate through linked list
+                // struct texture::info : public linked_node<info> {
+                //     linked_node<info>* next;  // +0x00 (from linked_node)
+                //     linked_node<info>* prev;  // +0x04 (from linked_node)
+                //     void* vtable;             // +0x08 (from platform_interface)
+                //     uint32_t key;             // +0x0C - HASH!
+                //     ...
+                //     texture::platform_info* pinfo;  // Need to find offset
+                // };
+
+                void* current = table->head;
+                int scanned = 0;
+                int mapped = 0;
+
+                while (current && scanned < 10000)  // Safety limit
+                {
+                    scanned++;
+
+                    // Read hash at offset +0x0C
+                    uint32_t hash = *reinterpret_cast<uint32_t*>(reinterpret_cast<uintptr_t>(current) + 0x0C);
+
+                    // Try to find platform_info pointer
+                    // It should be somewhere in the structure
+                    // Let's try common offsets: 0x14, 0x18, 0x1C, 0x20, 0x24, 0x28
+
+                    for (int offset = 0x14; offset <= 0x40; offset += 4)
+                    {
+                        void* potentialPinfo = *reinterpret_cast<void**>(reinterpret_cast<uintptr_t>(current) + offset);
+
+                        if (!potentialPinfo)
+                            continue;
+
+                        // platform_info has D3D texture at offset +0x08
+                        IDirect3DTexture9* d3dTexture = *reinterpret_cast<IDirect3DTexture9**>(
+                            reinterpret_cast<uintptr_t>(potentialPinfo) + 0x08);
+
+                        if (d3dTexture)
+                        {
+                            // Validate it's a real D3D texture by checking vtable
+                            void* vtable = *reinterpret_cast<void**>(d3dTexture);
+
+                            // D3D texture vtable should be in a reasonable memory range
+                            if (reinterpret_cast<uintptr_t>(vtable) > 0x10000000 &&
+                                reinterpret_cast<uintptr_t>(vtable) < 0x80000000)
+                            {
+                                // Store in reverse map (DISABLED - using TexWizard approach instead)
+                                // g_gameTextureToHash[d3dTexture] = hash;
+                                mapped++;
+
+                                // Log first 5 mappings
+                                if (mapped <= 5)
+                                {
+                                    asi_log::Log("CustomTextureLoader: Mapped texture %p -> hash 0x%08X (pinfo offset +0x%02X)",
+                                                 d3dTexture, hash, offset);
+                                }
+
+                                break;  // Found it, move to next texture::info
+                            }
+                        }
+                    }
+
+                    // Move to next node
+                    current = *reinterpret_cast<void**>(current);  // next pointer at +0x00
+                }
+
+                asi_log::Log("CustomTextureLoader: BuildGameTextureMap() - Scanned %d nodes, mapped %d textures",
+                             scanned, mapped);
             }
-
-            g_workerThreads.clear();
-            CloseHandle(g_iocp);
-            g_iocp = nullptr;
-            g_stopLoading.store(false);
-
-            // Release the device pointer we AddRef'd in StartIOCPLoading
-            if (g_d3dDevice)
+            __except(EXCEPTION_EXECUTE_HANDLER)
             {
-                g_d3dDevice->Release();
-                g_d3dDevice = nullptr;
+                asi_log::Log("CustomTextureLoader: BuildGameTextureMap() - Exception during scanning!");
             }
         }
-    }
 
-    // Start IOCP worker threads and post texture loading requests
-    void StartIOCPLoading(IDirect3DDevice9* device)
-    {
-        // Stop any existing workers
-        StopIOCPWorkers();
+        // CARBON: Hook AttachReplacementTextureTable to inject our custom texture replacements
+        // This is the OFFICIAL way Carbon swaps textures - much better than hooking GetTextureInfo!
+        //
+        // The game calls eModel::AttachReplacementTextureTable (0x005588D0) to apply texture replacements.
+        // We hook BEFORE this call (at 0x007D5743) and inject our own replacement entries.
+        //
+        // IMPORTANT: ExtendedCustomization uses __fastcall, so we'll do the same!
+        // At hook point 0x007D5743:
+        //   ECX = model pointer (fastcall first param)
+        //   EDX = unused (fastcall second param)
+        //   [esp+0x20] = some parameter from stack
+        //   EBX = count
 
-        if (!device)
+        // Texture type based on filename suffix
+        enum class TextureType
         {
-            asi_log::Log("CustomTextureLoader: Cannot start IOCP loading - device is NULL!");
-            return;
-        }
+            Unknown = -1,
+            Diffuse = 0,   // _D suffix, stage 0
+            Normal = 1,    // _N suffix, stage 1
+            Specular = 2   // _S suffix, stage 2
+        };
 
-        // Store device pointer globally for IOCP workers to access
-        // AddRef to keep it alive while workers are using it
-        device->AddRef();
-        g_d3dDevice = device;
-
-        // Reset counters
-        g_texturesLoaded.store(0);
-        g_totalTexturesToLoad.store(static_cast<int>(g_texturePathMap.size()));
-
-        if (g_totalTexturesToLoad.load() == 0)
+        // Map (game_texture, hash) pairs to custom textures
+        // We need BOTH because the game reuses the same D3D texture pointer for different hashes!
+        struct TextureKey
         {
-            asi_log::Log("CustomTextureLoader: No textures to load");
-            return;
-        }
+            IDirect3DTexture9* gameTexture;
+            uint32_t hash;
 
-        // Create IOCP
-        g_iocp = CreateIoCompletionPort(INVALID_HANDLE_VALUE, nullptr, 0, NUM_WORKER_THREADS);
-        if (!g_iocp)
-        {
-            asi_log::Log("CustomTextureLoader: Failed to create IOCP!");
-            return;
-        }
-
-        // Start worker threads
-        for (DWORD i = 0; i < NUM_WORKER_THREADS; i++)
-        {
-            g_workerThreads.emplace_back(IOCPWorkerThread);
-        }
-
-        asi_log::Log("CustomTextureLoader: Started %d IOCP worker threads", NUM_WORKER_THREADS);
-
-        // Post texture loading requests to IOCP queue
-        int requestsPosted = 0;
-        for (const auto& [hash, path] : g_texturePathMap)
-        {
-            // CRITICAL: Pass POINTER to device pointer, not the device itself!
-            // This matches the original ASI - workers dereference at load time to get CURRENT device
-            // This prevents crashes if the device is released/reset between post and load
-            TextureLoadRequest* request = new TextureLoadRequest{
-                hash, path, const_cast<IDirect3DDevice9**>(&g_d3dDevice)
-            };
-
-            // Post to IOCP queue
-            if (!PostQueuedCompletionStatus(g_iocp, 0, reinterpret_cast<ULONG_PTR>(request), nullptr))
+            bool operator==(const TextureKey& other) const
             {
-                asi_log::Log("CustomTextureLoader: Failed to post request for hash 0x%08X", hash);
-                delete request;
+                return gameTexture == other.gameTexture && hash == other.hash;
             }
-            else
+        };
+
+        struct TextureKeyHash
+        {
+            size_t operator()(const TextureKey& key) const
             {
-                requestsPosted++;
+                // Combine pointer and hash using XOR
+                return std::hash<void*>()(key.gameTexture) ^ std::hash<uint32_t>()(key.hash);
             }
-        }
+        };
 
-        asi_log::Log("CustomTextureLoader: Posted %d texture loading requests to IOCP queue", requestsPosted);
-    }
-
-    // Optimization: Helper function to set material texture (reduces code duplication)
-    // CRITICAL: texPtrStorage must point to STATIC or GLOBAL storage that persists!
-    // The game stores the ADDRESS of the texture pointer, not the value!
-    // addRefTexture: Whether to call AddRef() on the texture (only for custom textures, not game's original)
-    bool SetMaterialTexture(void* material, const char* paramName, IDirect3DTexture9* texture,
-                            IDirect3DTexture9** texPtrStorage, bool addRefTexture)
-    {
-        if (!material)
-            return false;
-
-        // CRITICAL: Don't pass NULL textures to the game!
-        if (!texture)
-            return false;
-
-        // CRITICAL: Only AddRef custom textures, NOT the game's original textures!
-        // The game already owns its own textures and manages their lifetime.
-        // But our custom textures need an extra reference because the game will Release() them.
-        if (addRefTexture)
-            texture->AddRef();
-
-        // Store texture in the provided static storage
-        *texPtrStorage = texture;
-
-        // Get material vtable
-        void** vtable = *reinterpret_cast<void***>(material);
-        void* getParameterFn = *reinterpret_cast<void**>(reinterpret_cast<char*>(vtable) + 0x28);
-        void* setValueFn = *reinterpret_cast<void**>(reinterpret_cast<char*>(vtable) + 0x50);
-
-        void* param = nullptr;
-
-        // Call GetParameter - custom calling convention:
-        // Material pointer is in ECX AND pushed on stack
-        // Original ASI: mov ecx, material; push "DiffuseMap"; push 0; push ecx; call
-        __asm {
-            mov ecx, material
-            push paramName
-            push 0
-            push ecx
-            mov eax, material
-            mov eax, [eax]
-            call dword ptr [eax + 0x28]
-            mov param, eax
-            }
-
-        if (!param)
+        struct CustomTextureInfo
         {
-            // Failed to get parameter - release the texture if we AddRef'd it
-            if (addRefTexture)
-                texture->Release();
-            return false;
-        }
+            IDirect3DTexture9* texture;
+            TextureType type;
+        };
 
-        // Call SetValue - custom calling convention:
-        // Material pointer is in ECX AND pushed on stack
-        // Original ASI: mov ecx, material; push 4; push &texture; push param; push ecx; call
-        // CRITICAL: Pass the address of the STATIC storage, not a local variable!
-        __asm {
-            mov ecx, material
-            mov eax, texPtrStorage
-            push 4
-            push eax
-            push param
-            push ecx
-            mov edx, material
-            mov edx, [edx]
-            call dword ptr [edx + 0x50]
-            }
+        // Map from hash to custom texture info
+        std::unordered_map<uint32_t, CustomTextureInfo> g_hashToCustomTextureMap;
 
-        return true;
-    }
+        // Map from game D3D texture pointer to hash (reverse lookup)
+        // This is populated in HookGetTextureInfo when the game loads textures
+        std::unordered_map<IDirect3DTexture9*, uint32_t> g_gameTextureToHash;
 
-    // Swap textures (called from Hook 2)
-    void SwapTextures()
-    {
-        g_swapCallCount++;
+        std::mutex g_d3dSwapMutex;
 
-        // Don't swap if paths haven't been loaded yet
-        if (!g_pathsLoaded)
-            return;
+        // Flag to disable hook during shutdown to prevent crashes
+        std::atomic<bool> g_hookEnabled{true};
 
-        // NEW APPROACH: Use the game's material API to set textures
-        // Read the game context object
-        void** ptrContext = reinterpret_cast<void**>(ngg::mw::GAME_CONTEXT_PTR);
-        void* context = *ptrContext;
+        // Original SetTexture function pointer
+        typedef HRESULT(__stdcall* SetTexture_t)(IDirect3DDevice9*, DWORD, IDirect3DBaseTexture9*);
+        SetTexture_t g_originalSetTexture = nullptr;
 
-        if (!context)
-            return;
-
-        // Get the material from context + 0x48
-        void* material = *reinterpret_cast<void**>(reinterpret_cast<char*>(context) + 0x48);
-
-        if (!material)
-            return;
-
-        // Read texture wrapper pointers
-        void** ptrWrapper1 = reinterpret_cast<void**>(ngg::mw::GAME_TEX_WRAPPER_1);
-        void** ptrWrapper2 = reinterpret_cast<void**>(ngg::mw::GAME_TEX_WRAPPER_2);
-        void** ptrWrapper3 = reinterpret_cast<void**>(ngg::mw::GAME_TEX_WRAPPER_3);
-
-        void* wrapper1 = *ptrWrapper1;
-        void* wrapper2 = *ptrWrapper2;
-        void* wrapper3 = *ptrWrapper3;
-
-        if (!wrapper1)
-            return;
-
-        // CRITICAL DISCOVERY from IDA analysis:
-        // The original ASI does: mov eax, [wrapper]; mov ecx, [eax+18h]
-        // This reads the GAME's original texture pointer from (wrapper[0])[0x18]
-        // Then it reads the hash from wrapper[0x24]
-        // Then it looks up a custom texture by hash
-        // If found, it REPLACES the texture pointer; otherwise it keeps the original
-        // Then it ALWAYS calls SetValue with a valid texture pointer!
-
-        // Read the inner structure pointer from wrapper[0]
-        void** innerStruct1 = wrapper1 ? *reinterpret_cast<void***>(wrapper1) : nullptr;
-        void** innerStruct2 = wrapper2 ? *reinterpret_cast<void***>(wrapper2) : nullptr;
-        void** innerStruct3 = wrapper3 ? *reinterpret_cast<void***>(wrapper3) : nullptr;
-
-        // Read the GAME's original texture pointers from innerStruct[0x18]
-        IDirect3DTexture9* gameTex1 = innerStruct1
-                                          ? *reinterpret_cast<IDirect3DTexture9**>(reinterpret_cast<char*>(innerStruct1)
-                                              + 0x18)
-                                          : nullptr;
-        IDirect3DTexture9* gameTex2 = innerStruct2
-                                          ? *reinterpret_cast<IDirect3DTexture9**>(reinterpret_cast<char*>(innerStruct2)
-                                              + 0x18)
-                                          : nullptr;
-        IDirect3DTexture9* gameTex3 = innerStruct3
-                                          ? *reinterpret_cast<IDirect3DTexture9**>(reinterpret_cast<char*>(innerStruct3)
-                                              + 0x18)
-                                          : nullptr;
-
-        // CRITICAL: The original ASI handles each texture INDEPENDENTLY!
-        // If texture 1 is NULL, it still processes textures 2 and 3!
-        // So we DON'T return early here - we process each texture separately below.
-
-        // Read hashes from the wrapper structures at offset +0x24
-        uint32_t hash1 = *reinterpret_cast<uint32_t*>(reinterpret_cast<char*>(wrapper1) + 0x24);
-        uint32_t hash2 = wrapper2 ? *reinterpret_cast<uint32_t*>(reinterpret_cast<char*>(wrapper2) + 0x24) : 0;
-        uint32_t hash3 = wrapper3 ? *reinterpret_cast<uint32_t*>(reinterpret_cast<char*>(wrapper3) + 0x24) : 0;
-
-        // Lookup custom textures (loaded by background thread)
-        // Returns NULL if texture not loaded yet - textures pop in gradually!
-        IDirect3DTexture9* customTex1 = GetTexture(hash1);
-        IDirect3DTexture9* customTex2 = GetTexture(hash2);
-        IDirect3DTexture9* customTex3 = GetTexture(hash3);
-
-        // CRITICAL: Use custom texture if available, otherwise use game's original texture
-        // The original ASI does: cmovnz ecx, eax (conditional move if custom texture found)
-        IDirect3DTexture9* finalTex1 = customTex1 ? customTex1 : gameTex1;
-        IDirect3DTexture9* finalTex2 = customTex2 ? customTex2 : gameTex2;
-        IDirect3DTexture9* finalTex3 = customTex3 ? customTex3 : gameTex3;
-
-        // CRITICAL: Use HEAP-ALLOCATED storage for texture pointers!
-        // The game stores the ADDRESS of these pointers, not the value!
-        // Static storage might get reused/overwritten, so use heap instead.
-        // These are intentionally leaked - the game needs them to persist forever!
-        static IDirect3DTexture9** s_texPtr1 = new IDirect3DTexture9*(nullptr);
-        static IDirect3DTexture9** s_texPtr2 = new IDirect3DTexture9*(nullptr);
-        static IDirect3DTexture9** s_texPtr3 = new IDirect3DTexture9*(nullptr);
-
-        // Parameter name strings
-        static const char* diffuseMapStr = "DiffuseMap";
-        static const char* normalMapStr = "NormalMapTexture";
-        static const char* specularMapStr = "SPECULARMAPTEXTURE";
-
-        // CRITICAL: ALWAYS call SetMaterialTexture with a valid texture!
-        // The original ASI always calls SetValue, even when there's no custom texture.
-        // It just passes the game's original texture back in that case.
-        // If we skip calling SetValue, the game's internal state gets corrupted!
-
-        // Set diffuse texture (ALWAYS - either custom or game's original)
-        if (finalTex1 && SetMaterialTexture(material, diffuseMapStr, finalTex1, s_texPtr1, customTex1 != nullptr))
+        // Hook IDirect3DDevice9::SetTexture to swap textures at D3D level
+        HRESULT __stdcall HookSetTexture(IDirect3DDevice9* device, DWORD stage, IDirect3DBaseTexture9* pTexture)
         {
-            if (customTex1) // Only count as success if we actually swapped
-                g_swapSuccessCount++;
-        }
+            // If hook is disabled or no texture, just call original
+            if (!g_hookEnabled.load() || !pTexture)
+                return g_originalSetTexture(device, stage, pTexture);
 
-        // Set normal texture (ALWAYS - either custom or game's original)
-        if (finalTex2 && SetMaterialTexture(material, normalMapStr, finalTex2, s_texPtr2, customTex2 != nullptr))
-        {
-            if (customTex2) // Only count as success if we actually swapped
-                g_swapSuccessCount++;
-        }
+            // Check if this is a texture we want to swap
+            IDirect3DTexture9* gameTexture = reinterpret_cast<IDirect3DTexture9*>(pTexture);
+            IDirect3DTexture9* customTexture = nullptr;
+            uint32_t hash = 0;
 
-        // Set specular texture (ALWAYS - either custom or game's original)
-        if (finalTex3 && SetMaterialTexture(material, specularMapStr, finalTex3, s_texPtr3, customTex3 != nullptr))
-        {
-            if (customTex3) // Only count as success if we actually swapped
-                g_swapSuccessCount++;
-        }
-    }
-
-    // Helper function to handle Hook 1 logic (called from naked function)
-    void HandleHookLoad()
-    {
-        // Log that Hook 1 was called
-        static int hookCallCount = 0;
-        hookCallCount++;
-        asi_log::Log("CustomTextureLoader: Hook 1 called (count: %d) - re-parsing texture paths...", hookCallCount);
-
-        // Re-parse texture paths (fast - no texture loading!)
-        g_pathsLoaded = false; // Force re-parse
-        ParseTexturePaths();
-
-        // NOTE: We do NOT start IOCP loading here!
-        // IOCP loading is started from SetD3DDevice() where we have a valid device pointer.
-        // Hook 1 is called when graphics settings change, which might happen before device creation.
-
-        asi_log::Log("CustomTextureLoader: Texture paths re-parsed - %d textures found", g_texturePathMap.size());
-    }
-
-    // Hook 1: Parse texture paths (called when graphics settings change)
-    // Re-parses JSON in case files changed - starts IOCP loading
-    __declspec(naked) void HookLoad()
-    {
-        __asm
             {
-            pushad
-            call HandleHookLoad
-            popad
-            ret
-            }
-    }
+                std::lock_guard<std::mutex> lock(g_d3dSwapMutex);
 
-    // Hook 2: Texture swapping (BACK to epilogue at 0x6C6C97)
-    __declspec(naked) void HookSwap()
-    {
-        __asm
+                // Step 1: Look up which hash this game texture corresponds to
+                auto hashIt = g_gameTextureToHash.find(gameTexture);
+                if (hashIt != g_gameTextureToHash.end())
+                {
+                    hash = hashIt->second;
+
+                    // Step 2: Look up custom texture by hash
+                    auto texIt = g_hashToCustomTextureMap.find(hash);
+                    if (texIt != g_hashToCustomTextureMap.end())
+                    {
+                        // Step 3: Check if texture type matches the stage
+                        const CustomTextureInfo& info = texIt->second;
+                        if (static_cast<int>(info.type) == static_cast<int>(stage))
+                        {
+                            customTexture = info.texture;
+                        }
+                    }
+                }
+            }
+
+            // If we have a custom texture, use it instead
+            if (customTexture)
             {
-            pushad
-            call SwapTextures
-            popad
-
-            // Execute original epilogue
-            pop edi
-            pop esi
-            pop ebx
-            mov esp, ebp
-            pop ebp
-            ret
+                static std::atomic<int> swapCount{0};
+                int count = swapCount.fetch_add(1) + 1;
+                if (count <= 20)
+                {
+                    asi_log::Log("CustomTextureLoader: SetTexture swap #%d - stage=%d, hash=0x%08X, game texture=%p -> custom texture=%p",
+                               count, stage, hash, gameTexture, customTexture);
+                }
+                return g_originalSetTexture(device, stage, customTexture);
             }
+
+            // No custom texture, use original
+            return g_originalSetTexture(device, stage, pTexture);
+        }
+
+        // Determine texture type from hash by looking up the path
+        TextureType GetTextureTypeFromHash(uint32_t hash)
+        {
+            std::lock_guard<std::mutex> lock(g_textureMutex);
+            auto it = g_texturePathMap.find(hash);
+            if (it != g_texturePathMap.end())
+            {
+                const std::string& path = it->second;
+                // Check the last characters before .dds extension
+                if (path.length() >= 6)
+                {
+                    std::string suffix = path.substr(path.length() - 6, 2);  // Get "_X" before ".dds"
+                    if (suffix == "_D") return TextureType::Diffuse;
+                    if (suffix == "_N") return TextureType::Normal;
+                    if (suffix == "_S") return TextureType::Specular;
+                }
+            }
+            return TextureType::Unknown;
+        }
+
+        // Hook TextureInfo::Get to build the game->custom texture mapping
+        // Original function: TextureInfo* __cdecl Get(uint32_t hash, bool defaultIfNotFound, bool includeUnloaded)
+        TextureInfo* __cdecl HookGetTextureInfo(uint32_t hash, bool defaultIfNotFound, bool includeUnloaded)
+        {
+            // Call original function to get the game's TextureInfo
+            TextureInfo* textureInfo = g_gameGetTextureInfo(hash, defaultIfNotFound, includeUnloaded);
+
+            // If hook is disabled (during shutdown), just return original
+            if (!g_hookEnabled.load())
+                return textureInfo;
+
+            // If we got a valid TextureInfo, check if we have a custom texture for this hash
+            // Note: TextureInfo::Invalid is (TextureInfo*)-1 according to ExtendedCustomization SDK
+            if (textureInfo && textureInfo != reinterpret_cast<TextureInfo*>(-1) && textureInfo->PlatInfo)
+            {
+                // Check if we have a custom texture for this hash
+                IDirect3DTexture9* customTexture = nullptr;
+                {
+                    std::lock_guard<std::mutex> lock(g_textureMutex);
+                    auto it = g_textureMap.find(hash);
+                    if (it != g_textureMap.end())
+                    {
+                        customTexture = it->second;
+                    }
+                }
+
+                // If we have a custom texture, add mapping from hash to custom texture
+                // ONLY if the hash corresponds to a valid game texture
+                if (customTexture && textureInfo->PlatInfo->pD3DTexture && IsValidGameTextureHash(hash))
+                {
+                    // Determine texture type from filename
+                    TextureType type = GetTextureTypeFromHash(hash);
+
+                    std::lock_guard<std::mutex> lock(g_d3dSwapMutex);
+
+                    // Store the mapping from hash to custom texture
+                    CustomTextureInfo info{customTexture, type};
+                    g_hashToCustomTextureMap[hash] = info;
+
+                    // Track which hash this game D3D texture corresponds to
+                    // This gets updated every time the game loads a texture
+                    g_gameTextureToHash[textureInfo->PlatInfo->pD3DTexture] = hash;
+
+                    static std::atomic<int> mapCount{0};
+                    int count = mapCount.fetch_add(1) + 1;
+                    if (count <= 20)
+                    {
+                        const char* typeStr = (type == TextureType::Diffuse) ? "Diffuse" :
+                                             (type == TextureType::Normal) ? "Normal" :
+                                             (type == TextureType::Specular) ? "Specular" : "Unknown";
+                        asi_log::Log("CustomTextureLoader: Mapped (game texture %p, hash 0x%08X, type=%s) -> custom texture %p",
+                                   textureInfo->PlatInfo->pD3DTexture, hash, typeStr, customTexture);
+                    }
+                }
+                else if (customTexture && !IsValidGameTextureHash(hash))
+                {
+                    // Log invalid hash (only first 10)
+                    static std::atomic<int> invalidCount{0};
+                    int count = invalidCount.fetch_add(1) + 1;
+                    if (count <= 10)
+                    {
+                        asi_log::Log("CustomTextureLoader: Skipping invalid hash 0x%08X (not in game texture list)", hash);
+                    }
+                }
+            }
+
+            // Always return the original TextureInfo - don't modify it!
+            return textureInfo;
+        }
+
+        // Swap textures (called from Hook 2)
+        void SwapTextures()
+        {
+            g_swapCallCount++;
+
+            // Don't swap if paths haven't been loaded yet
+            if (!g_pathsLoaded)
+                return;
+
+            // NEW APPROACH: Use the game's material API to set textures
+            // Read the game context object
+            void** ptrContext = reinterpret_cast<void**>(ngg::carbon::GAME_CONTEXT_PTR);
+            void* context = *ptrContext;
+
+            if (!context)
+                return;
+
+            // Get the material from context + 0x48
+            void* material = *reinterpret_cast<void**>(reinterpret_cast<char*>(context) + 0x48);
+
+            if (!material)
+                return;
+
+            // CARBON: Completely different architecture!
+            // Carbon uses texture::info structures that contain texture names and hashes
+            // We need to hook at a different location where we have access to texture::info
+            //
+            // The correct hook location is in effect::set_texture_maps() at line 970:
+            //   this->set_diffuse_map(*model.diffuse_texture_info);
+            //
+            // At that point, model.diffuse_texture_info contains:
+            //   - texture::info::key (hash of texture name)
+            //   - texture::info::name (texture name string)
+            //   - texture::info::pinfo->texture (D3D texture pointer)
+            //
+            // We should hook BEFORE set_diffuse_map() is called and modify the D3D texture pointers
+            // in the rendering_model structure.
+            //
+            // For now, this hook location (0x731138) is not the right place for Carbon.
+            // We need to find and hook effect::set_texture_maps() instead.
+
+            // Read the game's current texture pointers (for debugging)
+            IDirect3DTexture9** ptrGameTex1 = reinterpret_cast<IDirect3DTexture9**>(ngg::carbon::GAME_TEX_WRAPPER_1);
+            IDirect3DTexture9** ptrGameTex2 = reinterpret_cast<IDirect3DTexture9**>(ngg::carbon::GAME_TEX_WRAPPER_2);
+            IDirect3DTexture9** ptrGameTex3 = reinterpret_cast<IDirect3DTexture9**>(ngg::carbon::GAME_TEX_WRAPPER_3);
+
+            IDirect3DTexture9* gameTex1 = *ptrGameTex1;
+            IDirect3DTexture9* gameTex2 = *ptrGameTex2;
+            IDirect3DTexture9* gameTex3 = *ptrGameTex3;
+
+            // Skip if all textures are NULL (frontend rendering, not world rendering)
+            if (!gameTex1 && !gameTex2 && !gameTex3)
+                return;
+
+            // OLD APPROACH (disabled): Build reverse map and swap textures
+            // Now using TexWizard-style GetTextureInfo hook instead
+            /*
+            static bool mapBuilt = false;
+            if (!mapBuilt)
+            {
+                asi_log::Log("CustomTextureLoader: *** WORLD RENDERING DETECTED! *** tex1=%p, tex2=%p, tex3=%p",
+                             gameTex1, gameTex2, gameTex3);
+                asi_log::Log("CustomTextureLoader: Building reverse map NOW (textures should be loaded)...");
+
+                BuildGameTextureMap();
+
+                asi_log::Log("CustomTextureLoader: Reverse map built - size=%zu", g_gameTextureToHash.size());
+                mapBuilt = true;
+            }
+            */
+
+            // TexWizard approach: Texture swapping happens in HookGetTextureInfo()
+            // This hook location (0x731138) is not the right place for Carbon
+            // We're now hooking GetTextureInfo() calls instead
+
+            static int swapAttempts = 0;
+            if (swapAttempts < 5)
+            {
+                asi_log::Log("CustomTextureLoader: SwapTextures() called - tex1=%p, tex2=%p, tex3=%p",
+                             gameTex1, gameTex2, gameTex3);
+                swapAttempts++;
+            }
+
+            // CARBON SIMPLIFIED APPROACH:
+            // Instead of calling material API (which has different vtable offsets),
+            // we can directly modify the last_submitted_*_map_ pointers!
+            // The game reads from these addresses, so we just swap the pointers directly.
+
+            // For now, we can't swap without hashes, so just return
+            // TODO: Implement hash extraction or alternative identification method
+
+            // Placeholder: Would swap like this if we had hashes:
+            // IDirect3DTexture9* customTex1 = GetTexture(hash1);
+            // if (customTex1) {
+            //     *ptrGameTex1 = customTex1;  // Direct pointer swap!
+            //     g_swapSuccessCount++;
+            // }
+
+            return; // Not fully implemented yet
+        }
+
+        // Helper function to handle Hook 1 logic (called from naked function)
+        void HandleHookLoad()
+        {
+            // Log that Hook 1 was called
+            static int hookCallCount = 0;
+            hookCallCount++;
+            asi_log::Log("CustomTextureLoader: Hook 1 called (count: %d) - re-parsing texture paths...", hookCallCount);
+
+            // Re-parse texture paths (fast - no texture loading!)
+            g_pathsLoaded = false; // Force re-parse
+            ParseTexturePaths();
+
+            // NOTE: We do NOT start IOCP loading here!
+            // IOCP loading is started from SetD3DDevice() where we have a valid device pointer.
+            // Hook 1 is called when graphics settings change, which might happen before device creation.
+
+            asi_log::Log("CustomTextureLoader: Texture paths re-parsed - %d textures found", g_texturePathMap.size());
+        }
+
+        // Hook 1: Parse texture paths (called when graphics settings change)
+        // Re-parses JSON in case files changed - starts IOCP loading
+        __declspec(naked) void HookLoad()
+        {
+            __asm
+                {
+                pushad
+                call HandleHookLoad
+                popad
+                ret
+                }
+        }
+
+        // Hook 2: Texture swapping
+        // MW: Hooks before epilogue at 0x6C6C8D, executes epilogue manually
+        // Carbon: Hooks at CALL instruction at 0x731138
+        //         Original code: mov ecx, [mInstance__9FEManager]; call sub_5915D0
+        //         We replace the CALL with JMP to our hook, then execute the CALL ourselves
+        __declspec(naked) void HookSwap()
+        {
+            __asm
+                {
+                pushad
+                call SwapTextures
+                popad
+
+                // Carbon: Execute original CALL instruction
+                // The instruction at 0x731138 is: call sub_5915D0 (E8 93 04 E6 FF)
+                // ECX is already loaded with FEManager::mInstance by previous instruction at 0x731132
+                // We just need to execute the call
+                push 0x73113D  // Return address (instruction after the original call)
+                push 0x5915D0  // Target function address
+                ret            // Jump to sub_5915D0, it will return to 0x73113D
+                }
+        }
+
+        // These allow the override feature to patch the texture map when TexWizard collisions are detected
+        std::unordered_map<uint32_t, IDirect3DTexture9*>& GetTextureMap()
+        {
+            return g_textureMap;
+        }
+
+        std::unordered_map<uint32_t, std::string>& GetTexturePathMap()
+        {
+            return g_texturePathMap;
+        }
+
+        std::mutex& GetTextureMutex()
+        {
+            return g_textureMutex;
+        }
     }
 }
+
+// ============================================================================
+// CLASS MEMBER FUNCTIONS (outside namespace)
+// ============================================================================
 
 // Set D3D device (called from dllmain.cpp on every frame)
 // NOTE: With IOCP approach, we don't store the device globally!
 // Instead, we pass it WITH EACH TEXTURE LOADING REQUEST.
 void CustomTextureLoader::SetD3DDevice(IDirect3DDevice9* device)
 {
-    if (!device || !g_pathsLoaded)
+    if (!device || !ngg::carbon::g_pathsLoaded)
         return;
 
-    // Track if we need to (re)start IOCP loading
-    static size_t lastTextureCount = 0;
-    size_t currentTextureCount = g_texturePathMap.size();
-
-    // Start IOCP loading if:
-    // 1. First time device is set, OR
-    // 2. Texture paths changed (Hook 1 was called and re-parsed paths)
-    if (lastTextureCount != currentTextureCount)
+    // Hook IDirect3DDevice9::SetTexture (only once)
+    static bool setTextureHooked = false;
+    if (!setTextureHooked && device)
     {
-        asi_log::Log("CustomTextureLoader: Starting IOCP loading (%d textures)...", currentTextureCount);
-        StartIOCPLoading(device);
-        lastTextureCount = currentTextureCount;
+        // Get the vtable pointer
+        void** vtable = *reinterpret_cast<void***>(device);
+
+        // SetTexture is at index 65 in IDirect3DDevice9 vtable
+        void* setTextureAddr = vtable[65];
+
+        MH_STATUS status = MH_CreateHook(
+            setTextureAddr,
+            (LPVOID)&ngg::carbon::HookSetTexture,
+            (LPVOID*)&ngg::carbon::g_originalSetTexture
+        );
+
+        if (status == MH_OK)
+        {
+            status = MH_EnableHook(setTextureAddr);
+            if (status == MH_OK)
+            {
+                asi_log::Log("CustomTextureLoader: IDirect3DDevice9::SetTexture hook installed at %p", setTextureAddr);
+                setTextureHooked = true;
+            }
+            else
+            {
+                asi_log::Log("CustomTextureLoader: ERROR - SetTexture hook enable failed: %s", MH_StatusToString(status));
+            }
+        }
+        else
+        {
+            asi_log::Log("CustomTextureLoader: ERROR - SetTexture hook creation failed: %s", MH_StatusToString(status));
+        }
+    }
+
+    // Start IOCP loading only once (on first device set)
+    // The g_iocpStarted flag in StartIOCPLoading prevents duplicate calls
+    static bool firstCall = true;
+    if (firstCall)
+    {
+        firstCall = false;
+        size_t textureCount = ngg::carbon::g_texturePathMap.size();
+        asi_log::Log("CustomTextureLoader: Starting IOCP loading (%d textures)...", textureCount);
+        ngg::carbon::StartIOCPLoading(device);
     }
 }
 
 // Enable feature (install hooks)
 void CustomTextureLoader::enable()
 {
-    Feature::enable();
-
     asi_log::Log("CustomTextureLoader: Installing hooks...");
 
-    // Install Hook 1: Load all textures (called when graphics settings change)
-    injector::MakeJMP(ngg::mw::HOOK_LOAD_ADDR, &HookLoad, true);
+    // Initialize MinHook
+    MH_STATUS status = MH_Initialize();
+    if (status != MH_OK && status != MH_ERROR_ALREADY_INITIALIZED)
+    {
+        asi_log::Log("CustomTextureLoader: ERROR - MinHook initialization failed: %s", MH_StatusToString(status));
+        return;
+    }
+    asi_log::Log("CustomTextureLoader: MinHook initialized successfully");
 
-    // Install Hook 2: Texture swapping (just swaps, no loading)
-    injector::MakeJMP(ngg::mw::HOOK_SWAP_ADDR, &HookSwap, true);
+    // Install Hook 1: Load all textures (called when graphics settings change)
+    // NOTE: Carbon doesn't have HOOK_LOAD_ADDR (nullsub equivalent not found)
+    if (ngg::carbon::HOOK_LOAD_ADDR != 0)
+    {
+        status = MH_CreateHook(
+            (LPVOID)ngg::carbon::HOOK_LOAD_ADDR,
+            (LPVOID)&ngg::carbon::HookLoad,
+            (LPVOID*)&ngg::carbon::g_originalHookLoad
+        );
+
+        if (status != MH_OK)
+        {
+            asi_log::Log("CustomTextureLoader: ERROR - Hook 1 creation failed: %s", MH_StatusToString(status));
+        }
+        else
+        {
+            status = MH_EnableHook((LPVOID)ngg::carbon::HOOK_LOAD_ADDR);
+            if (status != MH_OK)
+            {
+                asi_log::Log("CustomTextureLoader: ERROR - Hook 1 enable failed: %s", MH_StatusToString(status));
+            }
+            else
+            {
+                asi_log::Log("CustomTextureLoader: Hook 1 installed at 0x%X", ngg::carbon::HOOK_LOAD_ADDR);
+            }
+        }
+    }
+    else
+    {
+        asi_log::Log("CustomTextureLoader: Hook 1 skipped (address not found - Carbon build?)");
+    }
+
+    // Install Hook 2: TextureInfo::Get hook for texture swapping
+    // CRITICAL: This is the CORRECT approach for Carbon!
+    // - TextureInfo::Get(hash, defaultIfNotFound, includeUnloaded) at 0x55CFD0
+    // - We call the original function, then swap the D3D texture pointer in PlatInfo
+    // - This works for ALL textures (world, cars, objects, etc.)
+
+    constexpr uintptr_t GET_TEXTURE_INFO_ADDR = 0x0055CFD0;
+
+    // Use MinHook to create the hook and trampoline
+    status = MH_CreateHook(
+        (LPVOID)GET_TEXTURE_INFO_ADDR,
+        (LPVOID)&ngg::carbon::HookGetTextureInfo,
+        (LPVOID*)&ngg::carbon::g_gameGetTextureInfo
+    );
+
+    if (status != MH_OK)
+    {
+        asi_log::Log("CustomTextureLoader: ERROR - GetTextureInfo hook creation failed: %s", MH_StatusToString(status));
+        return;
+    }
+
+    status = MH_EnableHook((LPVOID)GET_TEXTURE_INFO_ADDR);
+    if (status != MH_OK)
+    {
+        asi_log::Log("CustomTextureLoader: ERROR - GetTextureInfo hook enable failed: %s", MH_StatusToString(status));
+        return;
+    }
+
+    asi_log::Log("CustomTextureLoader: TextureInfo::Get hook installed at 0x%X (MinHook trampoline created)", GET_TEXTURE_INFO_ADDR);
 
     asi_log::Log("CustomTextureLoader: Hooks installed");
 
     // Parse texture paths at startup (fast - no texture loading!)
     asi_log::Log("CustomTextureLoader: Parsing texture paths at startup...");
-    ParseTexturePaths();
+    ngg::carbon::ParseTexturePaths();
     asi_log::Log("CustomTextureLoader: Texture path parsing complete - %d textures found",
-                 g_texturePathMap.size());
+                 ngg::carbon::g_texturePathMap.size());
+
+    // NOTE: BuildGameTextureMap() is called during first world rendering
+    // when textures are actually loaded in memory (not at startup)
 
     // IOCP loading will start when SetD3DDevice is called for the first time
     asi_log::Log("CustomTextureLoader: Waiting for D3D device to start IOCP loading...");
@@ -771,35 +1378,66 @@ void CustomTextureLoader::enable()
 // Disable feature (cleanup)
 void CustomTextureLoader::disable()
 {
-    Feature::disable();
-
     // Stop IOCP worker threads
     asi_log::Log("CustomTextureLoader: Stopping IOCP worker threads...");
-    StopIOCPWorkers();
+    ngg::carbon::StopIOCPWorkers();
 
-    // Release all textures
+    // Disable MinHook hooks
+    asi_log::Log("CustomTextureLoader: Disabling MinHook hooks...");
+    MH_DisableHook(MH_ALL_HOOKS);
+    MH_Uninitialize();
+
+    // Release all textures and texture_info structures
     {
-        std::lock_guard<std::mutex> lock(g_textureMutex);
+        std::lock_guard<std::mutex> lock(ngg::carbon::g_textureMutex);
 
         // Release 2D textures
-        for (auto& pair : g_textureMap)
+        for (auto& pair : ngg::carbon::g_textureMap)
         {
             if (pair.second)
                 pair.second->Release();
         }
-        g_textureMap.clear();
+        ngg::carbon::g_textureMap.clear();
 
         // Release volume textures
-        for (auto& pair : g_volumeTextureMap)
+        for (auto& pair : ngg::carbon::g_volumeTextureMap)
         {
             if (pair.second)
                 pair.second->Release();
         }
-        g_volumeTextureMap.clear();
+        ngg::carbon::g_volumeTextureMap.clear();
     }
 
-    g_texturePathMap.clear();
-    g_pathsLoaded = false;
+    ngg::carbon::g_texturePathMap.clear();
+    ngg::carbon::g_pathsLoaded = false;
 
     asi_log::Log("CustomTextureLoader: Disabled");
+}
+
+// Called by HookedSetTexture in dllmain.cpp
+// Returns a custom texture if we have one for the game's texture, otherwise nullptr
+// NOTE: This is never called in Carbon - the game doesn't use SetTexture!
+IDirect3DBaseTexture9* CustomTextureLoader::OnSetTexture(IDirect3DBaseTexture9* gameTexture)
+{
+    // SetTexture is never called in Carbon, so this function is not used
+    // Just return nullptr to avoid errors
+    return nullptr;
+}
+
+// Called from DllMain on DLL_PROCESS_DETACH to clean up before exit
+void CustomTextureLoader::Cleanup()
+{
+    asi_log::Log("CustomTextureLoader: Cleanup - disabling hook and clearing caches");
+
+    // Disable the hook to prevent crashes during shutdown
+    ngg::carbon::g_hookEnabled.store(false);
+
+    // Clear the hash->custom texture mapping and game texture->hash mapping
+    {
+        std::lock_guard<std::mutex> lock(ngg::carbon::g_d3dSwapMutex);
+        ngg::carbon::g_hashToCustomTextureMap.clear();
+        ngg::carbon::g_gameTextureToHash.clear();
+    }
+
+    asi_log::Log("CustomTextureLoader: Cleanup complete");
 }

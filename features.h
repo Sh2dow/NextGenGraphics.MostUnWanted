@@ -1,6 +1,6 @@
 #pragma once
 
-// #include "Log.h"
+#include "Log.h"
 // REMOVED: This macro was breaking OutputDebugStringA calls during early initialization
 // #define OutputDebugStringA(...) asi_log::Log(__VA_ARGS__)
 
@@ -27,7 +27,7 @@ namespace ngg
 
 namespace ngg
 {
-    namespace mw
+    namespace carbon
     {
         namespace features
         {
