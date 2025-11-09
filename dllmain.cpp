@@ -14,27 +14,19 @@ using namespace ngg::carbon;
 // TODO: Port full initialization logic from sub_10077220
 static std::vector<std::unique_ptr<ngg::common::Feature>> g_features;
 
-// Original Present function pointer
+// Original function pointers (set by MinHook)
 typedef HRESULT (APIENTRY*PresentFn)(IDirect3DDevice9*, CONST RECT*, CONST RECT*, HWND, CONST RGNDATA*);
 PresentFn g_originalPresent = nullptr;
 static std::atomic g_vtableHooked{false};
-static void** g_patchedVTableEntry = nullptr; // pointer to the vtable slot we patched
-static void* g_savedOriginalPtr = nullptr; // original pointer saved
 
-// Original CreateDevice function pointer
 typedef HRESULT (APIENTRY*CreateDeviceFn)(IDirect3D9*, UINT, D3DDEVTYPE, HWND, DWORD, D3DPRESENT_PARAMETERS*,
                                           IDirect3DDevice9**);
 CreateDeviceFn g_originalCreateDevice = nullptr;
 static std::atomic g_createDeviceHooked{false};
-static void** g_createDeviceVTableEntry = nullptr;
-static void* g_savedCreateDevicePtr = nullptr;
 
-// Original SetTexture function pointer
 typedef HRESULT (STDMETHODCALLTYPE*SetTextureFn)(IDirect3DDevice9*, DWORD, IDirect3DBaseTexture9*);
 SetTextureFn g_originalSetTexture = nullptr;
 static std::atomic g_setTextureHooked{false};
-static void** g_setTextureVTableEntry = nullptr;
-static void* g_savedSetTexturePtr = nullptr;
 
 bool triedInit = false;
 
@@ -42,7 +34,6 @@ bool triedInit = false;
 static void Initialize()
 {
     using namespace ngg::carbon::features;
-
     g_features.emplace_back(std::make_unique<CustomTextureLoader>());
 
     asi_log::Log("Setting up hooks\n");
@@ -87,18 +78,26 @@ HRESULT APIENTRY HookedCreateDevice(
                  behaviorFlags, newBehaviorFlags);
 
     // Call original CreateDevice with modified flags
+    HRESULT result = D3DERR_INVALIDCALL;
     if (g_originalCreateDevice)
-        return g_originalCreateDevice(d3d, adapter, deviceType, focusWindow, newBehaviorFlags, presentParams, device);
+    {
+        result = g_originalCreateDevice(d3d, adapter, deviceType, focusWindow, newBehaviorFlags, presentParams, device);
+    }
+    else
+    {
+        // Fallback: call through vtable
+        typedef HRESULT (APIENTRY*CreateDeviceLocalFn)(IDirect3D9*, UINT, D3DDEVTYPE, HWND, DWORD, D3DPRESENT_PARAMETERS*,
+                                                       IDirect3DDevice9**);
+        void** vtable = *reinterpret_cast<void***>(d3d);
+        CreateDeviceLocalFn createDeviceFn = reinterpret_cast<CreateDeviceLocalFn>(vtable[16]);
+        if (createDeviceFn && createDeviceFn != &HookedCreateDevice)
+            result = createDeviceFn(d3d, adapter, deviceType, focusWindow, newBehaviorFlags, presentParams, device);
+    }
 
-    // Fallback: call through vtable
-    typedef HRESULT (APIENTRY*CreateDeviceLocalFn)(IDirect3D9*, UINT, D3DDEVTYPE, HWND, DWORD, D3DPRESENT_PARAMETERS*,
-                                                   IDirect3DDevice9**);
-    void** vtable = *reinterpret_cast<void***>(d3d);
-    CreateDeviceLocalFn createDeviceFn = reinterpret_cast<CreateDeviceLocalFn>(vtable[16]);
-    if (createDeviceFn && createDeviceFn != &HookedCreateDevice)
-        return createDeviceFn(d3d, adapter, deviceType, focusWindow, newBehaviorFlags, presentParams, device);
+    // Device created successfully - CustomTextureLoader will start IOCP loading on first Present call
+    // (no need to call SetD3DDevice here)
 
-    return D3DERR_INVALIDCALL;
+    return result;
 }
 
 // Hooked SetTexture - intercepts all texture sets and swaps with custom textures
@@ -142,33 +141,14 @@ HRESULT APIENTRY HookedPresent(IDirect3DDevice9* device, CONST RECT* src, CONST 
     OnPresent(); // trigger Initialize logic
     CustomTextureLoader::SetD3DDevice(device);
 
-    // Install SetTexture hook on first call (when we have the real game device)
-    if (!g_setTextureHooked.load() && device)
-    {
-        void** deviceVTable = *reinterpret_cast<void***>(device);
-        if (deviceVTable)
-        {
-            void* originalSetTexturePtr = deviceVTable[65];
-            g_originalSetTexture = reinterpret_cast<SetTextureFn>(originalSetTexturePtr);
-
-            asi_log::Log("HookedPresent: Attempting to hook SetTexture at vtable[65] = %p", originalSetTexturePtr);
-
-            if (MakeVTableHook(deviceVTable, 65, reinterpret_cast<void*>(&HookedSetTexture), &g_savedSetTexturePtr))
-            {
-                g_setTextureHooked.store(true);
-                g_setTextureVTableEntry = &deviceVTable[65];
-                asi_log::Log("HookedPresent: IDirect3DDevice9::SetTexture hooked successfully - vtable[65] now points to %p\n", deviceVTable[65]);
-            }
-            else
-            {
-                asi_log::Log("HookedPresent: Failed to hook IDirect3DDevice9::SetTexture\n");
-            }
-        }
-    }
+    // NOTE: SetTexture hook is now installed in CustomTextureLoader.cpp::SetD3DDevice()
+    // This is because the hook needs to check texture type vs stage, which is handled there
 
     // DEBUG: Log what we're about to call
-    asi_log::Log("HookedPresent: About to call g_originalPresent = %p with device = %p\n", g_originalPresent, device);
-
+// #if _DEBUG
+//     asi_log::Log("HookedPresent: About to call g_originalPresent = %p with device = %p\n", g_originalPresent, device);
+// #endif
+    
     // Call the original Present if we have it; fallback safe behavior if not
     if (g_originalPresent)
         return g_originalPresent(device, src, dest, wnd, dirty);
@@ -183,7 +163,7 @@ HRESULT APIENTRY HookedPresent(IDirect3DDevice9* device, CONST RECT* src, CONST 
     return D3D_OK;
 }
 
-// Patch Present and CreateDevice by replacing vtable entries
+// Hook Present and CreateDevice using MinHook
 void HookPresent()
 {
     // Create dummy D3D9 object to get vtables
@@ -195,18 +175,25 @@ void HookPresent()
     void** d3dVTable = *reinterpret_cast<void***>(d3d);
     if (d3dVTable)
     {
-        void* originalCreateDevicePtr = d3dVTable[16];
-        g_originalCreateDevice = reinterpret_cast<CreateDeviceFn>(originalCreateDevicePtr);
+        void* createDeviceTarget = d3dVTable[16];
 
-        if (MakeVTableHook(d3dVTable, 16, reinterpret_cast<void*>(&HookedCreateDevice), &g_savedCreateDevicePtr))
+        MH_STATUS status = MH_CreateHook(createDeviceTarget, &HookedCreateDevice, reinterpret_cast<LPVOID*>(&g_originalCreateDevice));
+        if (status == MH_OK)
         {
-            g_createDeviceHooked.store(true);
-            g_createDeviceVTableEntry = &d3dVTable[16];
-            asi_log::Log("HookPresent: IDirect3D9::CreateDevice hooked successfully\n");
+            status = MH_EnableHook(createDeviceTarget);
+            if (status == MH_OK)
+            {
+                g_createDeviceHooked.store(true);
+                asi_log::Log("HookPresent: IDirect3D9::CreateDevice hooked successfully via MinHook\n");
+            }
+            else
+            {
+                asi_log::Log("HookPresent: Failed to enable CreateDevice hook: %s\n", MH_StatusToString(status));
+            }
         }
         else
         {
-            asi_log::Log("HookPresent: Failed to hook IDirect3D9::CreateDevice\n");
+            asi_log::Log("HookPresent: Failed to create CreateDevice hook: %s\n", MH_StatusToString(status));
         }
     }
 
@@ -233,22 +220,29 @@ void HookPresent()
         return;
     }
 
-    // Save original Present (index 17)
-    void* originalPtr = deviceVTable[17];
-    g_originalPresent = reinterpret_cast<PresentFn>(originalPtr);
+    // Hook Present (index 17) using MinHook - this will follow any existing hook chains
+    void* presentTarget = deviceVTable[17];
 
-    asi_log::Log("HookPresent: deviceVTable = %p, deviceVTable[17] = %p\n", deviceVTable, originalPtr);
+    asi_log::Log("HookPresent: deviceVTable = %p, deviceVTable[17] = %p\n", deviceVTable, presentTarget);
 
-    // Install Present hook
-    if (MakeVTableHook(deviceVTable, 17, reinterpret_cast<void*>(&HookedPresent), &g_savedOriginalPtr))
+    MH_STATUS status = MH_CreateHook(presentTarget, &HookedPresent, reinterpret_cast<LPVOID*>(&g_originalPresent));
+    if (status == MH_OK)
     {
-        g_vtableHooked.store(true);
-        g_patchedVTableEntry = &deviceVTable[17];
-        asi_log::Log("HookPresent: IDirect3DDevice9::Present hooked successfully\n");
+        status = MH_EnableHook(presentTarget);
+        if (status == MH_OK)
+        {
+            g_vtableHooked.store(true);
+            asi_log::Log("HookPresent: IDirect3DDevice9::Present hooked successfully via MinHook\n");
+            asi_log::Log("HookPresent: g_originalPresent = %p\n", g_originalPresent);
+        }
+        else
+        {
+            asi_log::Log("HookPresent: Failed to enable Present hook: %s\n", MH_StatusToString(status));
+        }
     }
     else
     {
-        asi_log::Log("HookPresent: Failed to hook IDirect3DDevice9::Present\n");
+        asi_log::Log("HookPresent: Failed to create Present hook: %s\n", MH_StatusToString(status));
     }
 
     // NOTE: SetTexture hook is installed dynamically in HookedPresent() when we get the real game device
@@ -261,52 +255,22 @@ void HookPresent()
 // Restore hooks (call on DLL unload)
 void UnhookPresent()
 {
-    // Unhook CreateDevice
-    if (g_createDeviceHooked.load() && g_createDeviceVTableEntry && g_savedCreateDevicePtr)
+    // Unhook all MinHook hooks
+    if (g_createDeviceHooked.load() || g_vtableHooked.load() || g_setTextureHooked.load())
     {
-        void** slot = g_createDeviceVTableEntry;
-        void** vtable = slot - 16; // reverse offset
-
-        if (UnmakeVTableHook(vtable, 16, g_savedCreateDevicePtr))
-            asi_log::Log("UnhookPresent: CreateDevice vtable slot restored\n");
+        MH_STATUS status = MH_DisableHook(MH_ALL_HOOKS);
+        if (status == MH_OK)
+        {
+            asi_log::Log("UnhookPresent: All hooks disabled successfully\n");
+        }
         else
-            asi_log::Log("UnhookPresent: Failed to restore CreateDevice vtable slot\n");
+        {
+            asi_log::Log("UnhookPresent: Failed to disable hooks: %s\n", MH_StatusToString(status));
+        }
 
         g_createDeviceHooked.store(false);
-        g_createDeviceVTableEntry = nullptr;
-        g_savedCreateDevicePtr = nullptr;
-    }
-
-    // Unhook Present
-    if (g_vtableHooked.load() && g_patchedVTableEntry && g_savedOriginalPtr)
-    {
-        void** slot = g_patchedVTableEntry;
-        void** vtable = slot - 17; // reverse offset
-
-        if (UnmakeVTableHook(vtable, 17, g_savedOriginalPtr))
-            asi_log::Log("UnhookPresent: Present vtable slot restored\n");
-        else
-            asi_log::Log("UnhookPresent: Failed to restore Present vtable slot\n");
-
         g_vtableHooked.store(false);
-        g_patchedVTableEntry = nullptr;
-        g_savedOriginalPtr = nullptr;
-    }
-
-    // Unhook SetTexture
-    if (g_setTextureHooked.load() && g_setTextureVTableEntry && g_savedSetTexturePtr)
-    {
-        void** slot = g_setTextureVTableEntry;
-        void** vtable = slot - 65; // reverse offset
-
-        if (UnmakeVTableHook(vtable, 65, g_savedSetTexturePtr))
-            asi_log::Log("UnhookPresent: SetTexture vtable slot restored\n");
-        else
-            asi_log::Log("UnhookPresent: Failed to restore SetTexture vtable slot\n");
-
         g_setTextureHooked.store(false);
-        g_setTextureVTableEntry = nullptr;
-        g_savedSetTexturePtr = nullptr;
     }
 
     g_originalPresent = nullptr;

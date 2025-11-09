@@ -203,6 +203,11 @@ namespace ngg
         // Use pointer to avoid destructor during CRT shutdown
         std::unordered_set<uint32_t>* g_loggedGenericTextures = nullptr;
 
+        // Pre-built swap table: hash -> custom texture (only for size-matched textures)
+        // This is built once after all textures are loaded
+        std::unordered_map<uint32_t, IDirect3DTexture9*>* g_swapTable = nullptr;
+        std::atomic<bool> g_swapTableBuilt{false};
+
         // IOCP-based thread pool for asynchronous texture loading
         HANDLE g_iocp = nullptr;
         // Use pointer to avoid destructor during CRT shutdown
@@ -215,6 +220,9 @@ namespace ngg
         // Global device pointer storage (updated by SetD3DDevice on render thread)
         // IOCP workers will read from this pointer
         IDirect3DDevice9* volatile g_d3dDevice = nullptr;
+
+        // Forward declaration
+        void BuildSwapTable();
 
         // Game's memory allocator functions (from NFSC SDK / NFSCBulbToys)
         // These are faster and more compatible than C++ new/delete
@@ -568,11 +576,15 @@ namespace ngg
                                              loaded, total);
                             }
 
-                            // When all textures are loaded, log completion
+                            // When all textures are loaded, log completion and build swap table
                             if (loaded == total && g_textureMap)
                             {
                                 asi_log::Log("CustomTextureLoader: All textures loaded - %d D3D textures ready", loaded);
                                 asi_log::Log("CustomTextureLoader: Custom texture map built - %d entries", g_textureMap->size());
+
+                                // Build the swap table (validates sizes and builds fast lookup)
+                                BuildSwapTable();
+
                                 asi_log::Log("CustomTextureLoader: Textures will be swapped via TextureInfo::Get hook as you drive around the world");
                             }
                         }
@@ -967,6 +979,16 @@ namespace ngg
         // Hook IDirect3DDevice9::SetTexture to swap textures at D3D level
         HRESULT __stdcall HookSetTexture(IDirect3DDevice9* device, DWORD stage, IDirect3DBaseTexture9* pTexture)
         {
+            // Track hook calls
+            static std::atomic<int> hookCallCount{0};
+            static bool loggedHookCalls = false;
+            int callCount = hookCallCount.fetch_add(1) + 1;
+            if (!loggedHookCalls && callCount >= 100)
+            {
+                asi_log::Log("CustomTextureLoader: HookSetTexture called %d times - hook is working!", callCount);
+                loggedHookCalls = true;
+            }
+
             // If hook is disabled or no texture, just call original
             if (!g_hookEnabled.load() || !pTexture)
                 return g_originalSetTexture(device, stage, pTexture);
@@ -992,7 +1014,19 @@ namespace ngg
                     {
                         // Step 3: Check if texture type matches the stage
                         const CustomTextureInfo& info = texIt->second;
-                        if (static_cast<int>(info.type) == static_cast<int>(stage))
+
+                        // Log first few type mismatches for debugging
+                        static std::atomic<int> mismatchCount{0};
+                        if (static_cast<int>(info.type) != static_cast<int>(stage))
+                        {
+                            int count = mismatchCount.fetch_add(1) + 1;
+                            if (count <= 5)
+                            {
+                                asi_log::Log("CustomTextureLoader: Type mismatch #%d - hash=0x%08X, texture type=%d, stage=%d",
+                                           count, hash, static_cast<int>(info.type), stage);
+                            }
+                        }
+                        else
                         {
                             customTexture = info.texture;
                         }
@@ -1055,7 +1089,71 @@ namespace ngg
             return TextureType::Unknown;
         }
 
-        // Hook TextureInfo::Get to build the game->custom texture mapping
+        // Build the swap table by validating all custom textures against game textures
+        // This is called once after all textures are loaded
+        void BuildSwapTable()
+        {
+            if (g_swapTableBuilt.load() || !g_textureMap || !g_gameGetTextureInfo)
+                return;
+
+            // Allocate swap table
+            if (!g_swapTable)
+                g_swapTable = new std::unordered_map<uint32_t, IDirect3DTexture9*>();
+
+            EnterCriticalSection(&g_textureMutex);
+
+            int totalCustomTextures = 0;
+            int validatedTextures = 0;
+            int invalidHashes = 0;
+
+            // Iterate through all custom textures - NO SIZE VALIDATION, swap everything!
+            for (const auto& pair : *g_textureMap)
+            {
+                uint32_t hash = pair.first;
+                IDirect3DTexture9* customTexture = pair.second;
+                totalCustomTextures++;
+
+                // CRITICAL: Validate custom texture pointer
+                if (!customTexture || customTexture == reinterpret_cast<IDirect3DTexture9*>(-1))
+                {
+                    invalidHashes++;
+                    continue;
+                }
+
+                // Skip if not a valid game texture hash
+                if (!IsValidGameTextureHash(hash))
+                {
+                    invalidHashes++;
+                    continue;
+                }
+
+                // CRITICAL: Final validation - try to AddRef/Release to ensure texture is valid
+                ULONG refCount = customTexture->AddRef();
+                if (refCount > 0)
+                {
+                    customTexture->Release();
+                    (*g_swapTable)[hash] = customTexture;
+                    validatedTextures++;
+                }
+                else
+                {
+                    // Texture is invalid (refcount was 0)
+                    invalidHashes++;
+                }
+            }
+
+            LeaveCriticalSection(&g_textureMutex);
+
+            g_swapTableBuilt.store(true);
+
+            asi_log::Log("CustomTextureLoader: Swap table built - %d total, %d validated, %d invalid hashes",
+                       totalCustomTextures, validatedTextures, invalidHashes);
+        }
+
+        // Track which textures we've already swapped to avoid swapping multiple times
+        std::unordered_set<uint32_t>* g_swappedHashes = nullptr;
+
+        // Hook TextureInfo::Get to swap textures using the pre-built swap table
         // Original function: TextureInfo* __cdecl Get(uint32_t hash, bool defaultIfNotFound, bool includeUnloaded)
         TextureInfo* __cdecl HookGetTextureInfo(uint32_t hash, bool defaultIfNotFound, bool includeUnloaded)
         {
@@ -1066,66 +1164,58 @@ namespace ngg
             if (!g_hookEnabled.load())
                 return textureInfo;
 
-            // If we got a valid TextureInfo, check if we have a custom texture for this hash
-            // Note: TextureInfo::Invalid is (TextureInfo*)-1 according to ExtendedCustomization SDK
-            if (textureInfo && textureInfo != reinterpret_cast<TextureInfo*>(-1) && textureInfo->PlatInfo && g_textureMap)
+            // If swap table is built, use it for fast lookup
+            if (g_swapTableBuilt.load() && g_swapTable && textureInfo &&
+                textureInfo != reinterpret_cast<TextureInfo*>(-1) && textureInfo->PlatInfo)
             {
-                // Check if we have a custom texture for this hash
-                IDirect3DTexture9* customTexture = nullptr;
+                EnterCriticalSection(&g_textureMutex);
+
+                // Check if we've already swapped this texture
+                if (!g_swappedHashes)
+                    g_swappedHashes = new std::unordered_set<uint32_t>();
+
+                // Only swap if we haven't swapped this hash before
+                if (g_swappedHashes->find(hash) == g_swappedHashes->end())
                 {
-                    EnterCriticalSection(&g_textureMutex);
-                    auto it = g_textureMap->find(hash);
-                    if (it != g_textureMap->end())
+                    auto it = g_swapTable->find(hash);
+                    if (it != g_swapTable->end())
                     {
-                        customTexture = it->second;
+                        // CRITICAL: Only swap if the custom texture is valid
+                        IDirect3DTexture9* customTexture = it->second;
+                        if (customTexture && customTexture != reinterpret_cast<IDirect3DTexture9*>(-1))
+                        {
+                            // DIRECT POINTER SWAP - just replace the D3D texture pointer ONCE
+                            textureInfo->PlatInfo->pD3DTexture = customTexture;
+
+                            // Mark this hash as swapped so we don't swap it again
+                            g_swappedHashes->insert(hash);
+
+                            // Log first 10 swaps
+                            static std::atomic<int> swapCount{0};
+                            int count = swapCount.fetch_add(1) + 1;
+                            if (count <= 10)
+                            {
+                                asi_log::Log("CustomTextureLoader: GetTextureInfo swap #%d - hash=0x%08X, swapped to %p (PERMANENT)",
+                                           count, hash, customTexture);
+                            }
+                        }
                     }
-                    LeaveCriticalSection(&g_textureMutex);
                 }
-
-                // If we have a custom texture, add mapping from hash to custom texture
-                // ONLY if the hash corresponds to a valid game texture
-                if (customTexture && textureInfo->PlatInfo->pD3DTexture && IsValidGameTextureHash(hash) &&
-                    g_hashToCustomTextureMap && g_gameTextureToHash)
+                else
                 {
-                    // Determine texture type from filename
-                    TextureType type = GetTextureTypeFromHash(hash);
-
-                    EnterCriticalSection(&g_d3dSwapMutex);
-
-                    // Store the mapping from hash to custom texture
-                    CustomTextureInfo info{customTexture, type};
-                    (*g_hashToCustomTextureMap)[hash] = info;
-
-                    // Track which hash this game D3D texture corresponds to
-                    // This gets updated every time the game loads a texture
-                    (*g_gameTextureToHash)[textureInfo->PlatInfo->pD3DTexture] = hash;
-
-                    static std::atomic<int> mapCount{0};
-                    int count = mapCount.fetch_add(1) + 1;
-                    if (count <= 20)
-                    {
-                        const char* typeStr = (type == TextureType::Diffuse) ? "Diffuse" :
-                                             (type == TextureType::Normal) ? "Normal" :
-                                             (type == TextureType::Specular) ? "Specular" : "Unknown";
-                        asi_log::Log("CustomTextureLoader: Mapped (game texture %p, hash 0x%08X, type=%s) -> custom texture %p",
-                                   textureInfo->PlatInfo->pD3DTexture, hash, typeStr, customTexture);
-                    }
-
-                    LeaveCriticalSection(&g_d3dSwapMutex);
-                }
-                else if (customTexture && !IsValidGameTextureHash(hash))
-                {
-                    // Log invalid hash (only first 10)
-                    static std::atomic<int> invalidCount{0};
-                    int count = invalidCount.fetch_add(1) + 1;
+                    // Log first 10 re-access attempts to verify we're not re-swapping
+                    static std::atomic<int> reAccessCount{0};
+                    int count = reAccessCount.fetch_add(1) + 1;
                     if (count <= 10)
                     {
-                        asi_log::Log("CustomTextureLoader: Skipping invalid hash 0x%08X (not in game texture list)", hash);
+                        asi_log::Log("CustomTextureLoader: GetTextureInfo re-access #%d - hash=0x%08X (already swapped, skipping)",
+                                   count, hash);
                     }
                 }
+
+                LeaveCriticalSection(&g_textureMutex);
             }
 
-            // Always return the original TextureInfo - don't modify it!
             return textureInfo;
         }
 
@@ -1315,40 +1405,8 @@ void CustomTextureLoader::SetD3DDevice(IDirect3DDevice9* device)
     if (!device || !ngg::carbon::g_pathsLoaded)
         return;
 
-    // Hook IDirect3DDevice9::SetTexture (only once)
-    static bool setTextureHooked = false;
-    if (!setTextureHooked && device)
-    {
-        // Get the vtable pointer
-        void** vtable = *reinterpret_cast<void***>(device);
-
-        // SetTexture is at index 65 in IDirect3DDevice9 vtable
-        void* setTextureAddr = vtable[65];
-
-        MH_STATUS status = MH_CreateHook(
-            setTextureAddr,
-            (LPVOID)&ngg::carbon::HookSetTexture,
-            (LPVOID*)&ngg::carbon::g_originalSetTexture
-        );
-
-        if (status == MH_OK)
-        {
-            status = MH_EnableHook(setTextureAddr);
-            if (status == MH_OK)
-            {
-                asi_log::Log("CustomTextureLoader: IDirect3DDevice9::SetTexture hook installed at %p", setTextureAddr);
-                setTextureHooked = true;
-            }
-            else
-            {
-                asi_log::Log("CustomTextureLoader: ERROR - SetTexture hook enable failed: %s", MH_StatusToString(status));
-            }
-        }
-        else
-        {
-            asi_log::Log("CustomTextureLoader: ERROR - SetTexture hook creation failed: %s", MH_StatusToString(status));
-        }
-    }
+    // SetTexture hook removed - we swap directly in GetTextureInfo instead
+    // This is the CORRECT approach for Carbon!
 
     // Start IOCP loading only once (on first device set)
     // The g_iocpStarted flag in StartIOCPLoading prevents duplicate calls
@@ -1522,12 +1580,63 @@ void CustomTextureLoader::disable()
 
 // Called by HookedSetTexture in dllmain.cpp
 // Returns a custom texture if we have one for the game's texture, otherwise nullptr
-// NOTE: This is never called in Carbon - the game doesn't use SetTexture!
+// SCOPE FILTERING: Only swap textures for TRACKS (world/environment), not UI/HUD elements
 IDirect3DBaseTexture9* CustomTextureLoader::OnSetTexture(IDirect3DBaseTexture9* gameTexture)
 {
-    // SetTexture is never called in Carbon, so this function is not used
-    // Just return nullptr to avoid errors
-    return nullptr;
+    if (!gameTexture)
+        return nullptr;
+
+    // Don't swap if paths haven't been loaded yet
+    if (!ngg::carbon::g_pathsLoaded)
+        return nullptr;
+
+    // Check if maps are initialized
+    if (!ngg::carbon::g_gameTextureToHash || !ngg::carbon::g_hashToCustomTextureMap)
+        return nullptr;
+
+    // SCOPE FILTER DISABLED: Rely on hash lookup instead
+    // If the texture isn't in our TRACKS texture map (g_gameTextureToHash),
+    // we won't swap it. This is more reliable than checking game memory addresses.
+
+    // Use the reverse lookup map to find the hash for this game texture
+    // This map is populated in HookGetTextureInfo when the game loads textures
+    IDirect3DTexture9* gameTexture2D = reinterpret_cast<IDirect3DTexture9*>(gameTexture);
+
+    EnterCriticalSection(&ngg::carbon::g_d3dSwapMutex);
+
+    // Step 1: Look up which hash this game texture corresponds to
+    auto hashIt = ngg::carbon::g_gameTextureToHash->find(gameTexture2D);
+    if (hashIt == ngg::carbon::g_gameTextureToHash->end())
+    {
+        LeaveCriticalSection(&ngg::carbon::g_d3dSwapMutex);
+        return nullptr; // This texture is not in our map (probably not a TRACKS texture)
+    }
+
+    uint32_t hash = hashIt->second;
+
+    // Step 2: Look up custom texture by hash
+    auto texIt = ngg::carbon::g_hashToCustomTextureMap->find(hash);
+    if (texIt == ngg::carbon::g_hashToCustomTextureMap->end())
+    {
+        LeaveCriticalSection(&ngg::carbon::g_d3dSwapMutex);
+        return nullptr; // No custom texture for this hash
+    }
+
+    IDirect3DTexture9* customTexture = texIt->second.texture;
+    LeaveCriticalSection(&ngg::carbon::g_d3dSwapMutex);
+
+    // Track successful swaps
+    static std::atomic<int> swapCount{0};
+    int count = swapCount.fetch_add(1) + 1;
+
+    // Log first 10 swaps for debugging
+    if (count <= 10)
+    {
+        asi_log::Log("CustomTextureLoader: Swapped texture #%d - hash=0x%08X, game=%p, custom=%p",
+                     count, hash, gameTexture, customTexture);
+    }
+
+    return customTexture;
 }
 
 // Set shutdown flag (called from DllMain during DLL_PROCESS_DETACH)
