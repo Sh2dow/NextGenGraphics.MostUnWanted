@@ -57,7 +57,7 @@
         <ClCompile>
             <LanguageStandard>stdcpp17</LanguageStandard>
             <AdditionalIncludeDirectories>
-                includes;includes\injector;includes\json\include;includes\spdlog\include;
+                includes;includes\json\include;includes\spdlog\include;
                 $(DXSDK_DIR)Include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
         </ClCompile>
         <Link>
@@ -72,6 +72,7 @@
             <WarningLevel>Level3</WarningLevel>
             <Optimization>Disabled</Optimization>
             <PreprocessorDefinitions>WIN32;_DEBUG;_WINDOWS;_USRDLL;_CRT_SECURE_NO_WARNINGS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+            <RuntimeLibrary>MultiThreadedDebug</RuntimeLibrary>
         </ClCompile>
         <Link>
             <GenerateDebugInformation>true</GenerateDebugInformation>
@@ -85,6 +86,7 @@
             <PreprocessorDefinitions>WIN32;_RELEASE;_WINDOWS;_USRDLL;_CRT_SECURE_NO_WARNINGS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
             <FunctionLevelLinking>true</FunctionLevelLinking>
             <IntrinsicFunctions>true</IntrinsicFunctions>
+            <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
         </ClCompile>
         <Link>
             <GenerateDebugInformation>false</GenerateDebugInformation>
@@ -105,10 +107,23 @@
         <ClInclude Include="CustomTextureLoader.h"/>
         <ClInclude Include="features.h"/>
         <ClInclude Include="includes\IniReader.h" />
+        <ClInclude Include="includes\minhook\include\MinHook.h" />
+        <ClInclude Include="includes\minhook\src\buffer.h" />
+        <ClInclude Include="includes\minhook\src\hde\hde32.h" />
+        <ClInclude Include="includes\minhook\src\hde\hde64.h" />
+        <ClInclude Include="includes\minhook\src\hde\pstdint.h" />
+        <ClInclude Include="includes\minhook\src\hde\table32.h" />
+        <ClInclude Include="includes\minhook\src\hde\table64.h" />
+        <ClInclude Include="includes\minhook\src\trampoline.h" />
         <ClInclude Include="NFSMW_PreFEngHook.h" />
         <ClInclude Include="Log.h" />
     </ItemGroup>
     <ItemGroup>
+        <ClCompile Include="includes\minhook\src\buffer.c" />
+        <ClCompile Include="includes\minhook\src\hde\hde32.c" />
+        <ClCompile Include="includes\minhook\src\hde\hde64.c" />
+        <ClCompile Include="includes\minhook\src\hook.c" />
+        <ClCompile Include="includes\minhook\src\trampoline.c" />
         <ClCompile Include="dllmain.cpp" />
         <ClCompile Include="stdafx.h"/>
         <ClCompile Include="CustomTextureLoader.cpp"/>

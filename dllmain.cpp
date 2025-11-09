@@ -8,6 +8,7 @@
 #include "features.h"
 #include "CustomTextureLoader.h"
 #include "Log.h"
+#include "includes/minhook/include/MinHook.h"
 
 using namespace ngg::mw;
 
@@ -15,17 +16,16 @@ using namespace ngg::mw;
 static std::vector<std::unique_ptr<ngg::common::Feature>> g_features;
 
 // Original Present function pointer
-typedef HRESULT (APIENTRY*PresentFn)(IDirect3DDevice9*, CONST RECT*, CONST RECT*, HWND, CONST RGNDATA*);
+typedef HRESULT(APIENTRY* PresentFn)(IDirect3DDevice9*, CONST RECT*, CONST RECT*, HWND, CONST RGNDATA*);
 PresentFn g_originalPresent = nullptr;
-static std::atomic g_vtableHooked{false};
+static std::atomic g_vtableHooked{ false };
 static void** g_patchedVTableEntry = nullptr; // pointer to the vtable slot we patched
-static void* g_savedOriginalPtr = nullptr; // original pointer saved
+static void* g_savedOriginalPtr = nullptr;    // original pointer saved
 
 // Original CreateDevice function pointer
-typedef HRESULT (APIENTRY*CreateDeviceFn)(IDirect3D9*, UINT, D3DDEVTYPE, HWND, DWORD, D3DPRESENT_PARAMETERS*,
-                                          IDirect3DDevice9**);
+typedef HRESULT(APIENTRY* CreateDeviceFn)(IDirect3D9*, UINT, D3DDEVTYPE, HWND, DWORD, D3DPRESENT_PARAMETERS*, IDirect3DDevice9**);
 CreateDeviceFn g_originalCreateDevice = nullptr;
-static std::atomic g_createDeviceHooked{false};
+static std::atomic g_createDeviceHooked{ false };
 static void** g_createDeviceVTableEntry = nullptr;
 static void* g_savedCreateDevicePtr = nullptr;
 
@@ -84,8 +84,7 @@ HRESULT APIENTRY HookedCreateDevice(
         return g_originalCreateDevice(d3d, adapter, deviceType, focusWindow, newBehaviorFlags, presentParams, device);
 
     // Fallback: call through vtable
-    typedef HRESULT (APIENTRY*CreateDeviceLocalFn)(IDirect3D9*, UINT, D3DDEVTYPE, HWND, DWORD, D3DPRESENT_PARAMETERS*,
-                                                   IDirect3DDevice9**);
+    typedef HRESULT(APIENTRY* CreateDeviceLocalFn)(IDirect3D9*, UINT, D3DDEVTYPE, HWND, DWORD, D3DPRESENT_PARAMETERS*, IDirect3DDevice9**);
     void** vtable = *reinterpret_cast<void***>(d3d);
     CreateDeviceLocalFn createDeviceFn = reinterpret_cast<CreateDeviceLocalFn>(vtable[16]);
     if (createDeviceFn && createDeviceFn != &HookedCreateDevice)
@@ -95,8 +94,7 @@ HRESULT APIENTRY HookedCreateDevice(
 }
 
 // Hooked Present (unchanged behaviour)
-HRESULT APIENTRY HookedPresent(IDirect3DDevice9* device, CONST RECT* src, CONST RECT* dest, HWND wnd,
-                               CONST RGNDATA* dirty)
+HRESULT APIENTRY HookedPresent(IDirect3DDevice9* device, CONST RECT* src, CONST RECT* dest, HWND wnd, CONST RGNDATA* dirty)
 {
     OnPresent(); // trigger Initialize logic
     CustomTextureLoader::SetD3DDevice(device);
@@ -106,7 +104,7 @@ HRESULT APIENTRY HookedPresent(IDirect3DDevice9* device, CONST RECT* src, CONST 
         return g_originalPresent(device, src, dest, wnd, dirty);
 
     // If no original, call through device's vtable (best-effort)
-    typedef HRESULT (APIENTRY*PresentLocalFn)(IDirect3DDevice9*, CONST RECT*, CONST RECT*, HWND, CONST RGNDATA*);
+    typedef HRESULT(APIENTRY* PresentLocalFn)(IDirect3DDevice9*, CONST RECT*, CONST RECT*, HWND, CONST RGNDATA*);
     void** vtable = *reinterpret_cast<void***>(device);
     PresentLocalFn presentFn = reinterpret_cast<PresentLocalFn>(vtable[17]);
     if (presentFn && presentFn != &HookedPresent)
@@ -232,6 +230,15 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
     {
         DisableThreadLibraryCalls(hModule);
 
+        // Initialize MinHook
+        MH_STATUS status = MH_Initialize();
+        if (status != MH_OK)
+        {
+            asi_log::Log("DllMain: Failed to initialize MinHook: %s\n", MH_StatusToString(status));
+            return FALSE;
+        }
+        asi_log::Log("DllMain: MinHook initialized successfully\n");
+
         CreateThread(nullptr, 0, [](LPVOID) -> DWORD
         {
             HookPresent(); // install vtable patching on a background thread
@@ -240,6 +247,14 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
     }
     else if (reason == DLL_PROCESS_DETACH)
     {
+        // CRITICAL: Set shutdown flag FIRST to prevent any cleanup operations
+        // This tells CustomTextureLoader to skip ALL cleanup (D3D, CRT, etc.)
+        CustomTextureLoader::SetShuttingDown();
+
+        // Clear g_features vector to call destructors while CRT is still valid
+        // The destructors will see g_isShuttingDown=true and skip cleanup
+        g_features.clear();
+
         // NOTE: We don't call feature->disable() here because:
         // 1. The game may have already destroyed D3D resources
         // 2. Calling Release() on already-freed D3D objects causes crashes
@@ -251,6 +266,9 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
 
         // Unhook Present (this is safe because we control the vtable)
         UnhookPresent();
+
+        // Uninitialize MinHook
+        MH_Uninitialize();
     }
 
     return TRUE;

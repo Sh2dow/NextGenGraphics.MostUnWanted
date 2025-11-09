@@ -19,5 +19,8 @@ public:
 
     // Called from HookedPresent to provide the D3D device
     static void SetD3DDevice(IDirect3DDevice9* device);
+
+    // Called from DllMain to signal shutdown (skip cleanup)
+    static void SetShuttingDown();
 };
 
