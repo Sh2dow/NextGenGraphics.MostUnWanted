@@ -14,11 +14,7 @@
 #include <d3dx9.h>
 
 // Conditional compilation for MW vs Carbon
-#ifdef NFSC
 #include "NFSC_PreFEngHook.h"
-#else
-#include "NFSC_PreFEngHook.h"
-#endif
 
 #include "Log.h"
 #include "includes/minhook/include/MinHook.h"
@@ -76,14 +72,29 @@ namespace ngg
 {
     namespace carbon
     {
+        // ============================================================================
+        // SHUTDOWN SAFETY
+        // ============================================================================
+        // CRITICAL: Flag to prevent cleanup operations during DLL unload
+        // During DLL unload, the CRT and D3D are being torn down, and ANY cleanup
+        // operations (even texture->Release()) can trigger crashes.
+        static bool g_isShuttingDown = false;
+
+        // ============================================================================
+        // MEMORY MANAGEMENT - Use pointers to prevent destructor crashes
+        // ============================================================================
+        // CRITICAL: Use raw pointers instead of direct STL objects to prevent
+        // destructor crashes during CRT shutdown. These are NEVER deleted - the OS
+        // cleans them up when the process exits.
+
         // Hash → file path mapping (built during Hook 1)
-        std::unordered_map<uint32_t, std::string> g_texturePathMap;
+        std::unordered_map<uint32_t, std::string>* g_texturePathMap = nullptr;
 
         // Hash → loaded 2D texture mapping (populated by IOCP worker threads)
-        std::unordered_map<uint32_t, IDirect3DTexture9*> g_textureMap;
+        std::unordered_map<uint32_t, IDirect3DTexture9*>* g_textureMap = nullptr;
 
         // Hash → loaded volume texture mapping (for 3D textures like LUTs)
-        std::unordered_map<uint32_t, IDirect3DVolumeTexture9*> g_volumeTextureMap;
+        std::unordered_map<uint32_t, IDirect3DVolumeTexture9*>* g_volumeTextureMap = nullptr;
 
         // CARBON-SPECIFIC: Texture replacement via TextureInfo::Get hook
         //
@@ -157,12 +168,21 @@ namespace ngg
 
 
 
+        // ============================================================================
+        // THREAD SYNCHRONIZATION - Use CRITICAL_SECTION instead of std::mutex
+        // ============================================================================
+        // CRITICAL: Use raw Windows CRITICAL_SECTION instead of std::mutex to avoid
+        // CRT crashes during DLL unload. These are NEVER deleted - OS cleans them up.
+
         // Mutex for thread-safe texture map access
-        std::mutex g_textureMutex;
+        CRITICAL_SECTION g_textureMutex;
 
         // CRITICAL: D3DX functions might not be thread-safe even with D3DCREATE_MULTITHREADED!
         // Serialize all D3DX calls to prevent heap corruption
-        std::mutex g_d3dxMutex;
+        CRITICAL_SECTION g_d3dxMutex;
+
+        // Track if mutexes have been initialized
+        bool g_mutexesInitialized = false;
 
         // TextureInfo::Get function (0x0055CFD0)
         // Signature: TextureInfo* __cdecl Get(uint32_t hash, bool defaultIfNotFound, bool includeUnloaded)
@@ -180,11 +200,13 @@ namespace ngg
         uint32_t g_swapSuccessCount = 0;
 
         // Track which generic textures have been logged (one-time logging)
-        std::unordered_set<uint32_t> g_loggedGenericTextures;
+        // Use pointer to avoid destructor during CRT shutdown
+        std::unordered_set<uint32_t>* g_loggedGenericTextures = nullptr;
 
         // IOCP-based thread pool for asynchronous texture loading
         HANDLE g_iocp = nullptr;
-        std::vector<std::thread> g_workerThreads;
+        // Use pointer to avoid destructor during CRT shutdown
+        std::vector<std::thread>* g_workerThreads = nullptr;
         std::atomic<bool> g_stopLoading{false};
         std::atomic<int> g_texturesLoaded{0};
         std::atomic<int> g_totalTexturesToLoad{0};
@@ -266,7 +288,8 @@ namespace ngg
                 asi_log::Log("CustomTextureLoader: Parsing texture paths...");
 
                 // Optimization: Reserve capacity for expected texture count
-                g_texturePathMap.reserve(EXPECTED_TEXTURE_COUNT);
+                if (g_texturePathMap)
+                    g_texturePathMap->reserve(EXPECTED_TEXTURE_COUNT);
 
                 int totalPaths = 0;
                 int skippedMissing = 0;
@@ -284,7 +307,8 @@ namespace ngg
                         uint32_t hash = CalcHash(filename);
                         std::string fullPath = entry.path().string();
 
-                        g_texturePathMap[hash] = fullPath;
+                        if (g_texturePathMap)
+                            (*g_texturePathMap)[hash] = fullPath;
                         totalPaths++;
                     }
                 }
@@ -325,7 +349,8 @@ namespace ngg
                                 continue;
                             }
 
-                            g_texturePathMap[hash] = fullPath.string();
+                            if (g_texturePathMap)
+                                (*g_texturePathMap)[hash] = fullPath.string();
                             totalPaths++;
                         }
                     }
@@ -345,22 +370,24 @@ namespace ngg
         // Returns texture if loaded by background thread, NULL otherwise
         IDirect3DTexture9* GetTexture(uint32_t hash)
         {
-            if (hash == 0)
+            if (hash == 0 || !g_textureMap)
                 return nullptr;
 
-            std::lock_guard<std::mutex> lock(g_textureMutex);
+            EnterCriticalSection(&g_textureMutex);
 
             // Just lookup in map - NO on-demand loading!
-            auto it = g_textureMap.find(hash);
-            if (it != g_textureMap.end())
+            auto it = g_textureMap->find(hash);
+            if (it != g_textureMap->end())
             {
                 IDirect3DTexture9* texture = it->second;
+                LeaveCriticalSection(&g_textureMutex);
                 // DON'T call AddRef() - the game doesn't expect it!
                 // The texture is already owned by us (stored in the map)
                 // The game will just use it, not take ownership
                 return texture;
             }
 
+            LeaveCriticalSection(&g_textureMutex);
             return nullptr; // Not loaded yet by background thread
         }
 
@@ -369,20 +396,27 @@ namespace ngg
         // because they're rare (only LUTs) and need to be available immediately
         IDirect3DVolumeTexture9* GetVolumeTexture(uint32_t hash, IDirect3DDevice9* device)
         {
-            if (hash == 0 || !device)
+            if (hash == 0 || !device || !g_volumeTextureMap || !g_texturePathMap)
                 return nullptr;
 
-            std::lock_guard<std::mutex> lock(g_textureMutex);
+            EnterCriticalSection(&g_textureMutex);
 
             // Check if already loaded
-            auto it = g_volumeTextureMap.find(hash);
-            if (it != g_volumeTextureMap.end())
-                return it->second;
+            auto it = g_volumeTextureMap->find(hash);
+            if (it != g_volumeTextureMap->end())
+            {
+                IDirect3DVolumeTexture9* texture = it->second;
+                LeaveCriticalSection(&g_textureMutex);
+                return texture;
+            }
 
             // Check if we have a path for this hash
-            auto pathIt = g_texturePathMap.find(hash);
-            if (pathIt == g_texturePathMap.end())
+            auto pathIt = g_texturePathMap->find(hash);
+            if (pathIt == g_texturePathMap->end())
+            {
+                LeaveCriticalSection(&g_textureMutex);
                 return nullptr;
+            }
 
             // Load volume texture on-demand
             IDirect3DVolumeTexture9* volumeTexture = nullptr;
@@ -395,12 +429,16 @@ namespace ngg
             if (SUCCEEDED(hr) && volumeTexture)
             {
                 // Cache the loaded texture
-                g_volumeTextureMap[hash] = volumeTexture;
+                (*g_volumeTextureMap)[hash] = volumeTexture;
+                LeaveCriticalSection(&g_textureMutex);
                 return volumeTexture;
             }
 
+            LeaveCriticalSection(&g_textureMutex);
+
             // Failed to load - remove from path map to avoid retrying
-            g_texturePathMap.erase(pathIt);
+            if (g_texturePathMap)
+                g_texturePathMap->erase(pathIt);
             return nullptr;
         }
 
@@ -471,27 +509,28 @@ namespace ngg
                     IDirect3DTexture9* texture = nullptr;
                     HRESULT hr;
                     {
-                        std::lock_guard<std::mutex> d3dxLock(g_d3dxMutex);
+                        EnterCriticalSection(&g_d3dxMutex);
                         hr = D3DXCreateTextureFromFileA(
                             device,
                             request->path.c_str(),
                             &texture
                         );
+                        LeaveCriticalSection(&g_d3dxMutex);
                     }
 
                     // Release the device reference we added
                     device->Release();
 
-                    if (SUCCEEDED(hr) && texture)
+                    if (SUCCEEDED(hr) && texture && g_textureMap)
                     {
                         // CARBON: Store D3D texture in map for GetTextureInfo hook
                         bool textureStored = false;
                         {
-                            std::lock_guard<std::mutex> lock(g_textureMutex);
+                            EnterCriticalSection(&g_textureMutex);
 
                             // Check if already loaded (prevents memory leak from duplicate loads)
-                            auto it = g_textureMap.find(request->hash);
-                            if (it != g_textureMap.end())
+                            auto it = g_textureMap->find(request->hash);
+                            if (it != g_textureMap->end())
                             {
                                 // Already loaded - release the new texture and keep the old one
                                 texture->Release();
@@ -500,7 +539,7 @@ namespace ngg
                             else
                             {
                                 // First time loading this hash - store it
-                                g_textureMap[request->hash] = texture;
+                                (*g_textureMap)[request->hash] = texture;
                                 textureStored = true;
 
                                 // Log first 20 loaded hashes
@@ -512,6 +551,8 @@ namespace ngg
                                     logCount++;
                                 }
                             }
+
+                            LeaveCriticalSection(&g_textureMutex);
                         }
 
                         // Only increment counter if texture was actually stored (not a duplicate)
@@ -528,10 +569,10 @@ namespace ngg
                             }
 
                             // When all textures are loaded, log completion
-                            if (loaded == total)
+                            if (loaded == total && g_textureMap)
                             {
                                 asi_log::Log("CustomTextureLoader: All textures loaded - %d D3D textures ready", loaded);
-                                asi_log::Log("CustomTextureLoader: Custom texture map built - %d entries", g_textureMap.size());
+                                asi_log::Log("CustomTextureLoader: Custom texture map built - %d entries", g_textureMap->size());
                                 asi_log::Log("CustomTextureLoader: Textures will be swapped via TextureInfo::Get hook as you drive around the world");
                             }
                         }
@@ -558,19 +599,23 @@ namespace ngg
                 g_stopLoading.store(true);
 
                 // Post shutdown signals to all worker threads
-                for (size_t i = 0; i < g_workerThreads.size(); i++)
+                if (g_workerThreads)
                 {
-                    PostQueuedCompletionStatus(g_iocp, 0, 0, nullptr);
+                    for (size_t i = 0; i < g_workerThreads->size(); i++)
+                    {
+                        PostQueuedCompletionStatus(g_iocp, 0, 0, nullptr);
+                    }
+
+                    // Wait for all threads to finish
+                    for (auto& thread : *g_workerThreads)
+                    {
+                        if (thread.joinable())
+                            thread.join();
+                    }
+
+                    g_workerThreads->clear();
                 }
 
-                // Wait for all threads to finish
-                for (auto& thread : g_workerThreads)
-                {
-                    if (thread.joinable())
-                        thread.join();
-                }
-
-                g_workerThreads.clear();
                 CloseHandle(g_iocp);
                 g_iocp = nullptr;
                 g_stopLoading.store(false);
@@ -614,7 +659,8 @@ namespace ngg
 
             // Reset counters
             g_texturesLoaded.store(0);
-            g_totalTexturesToLoad.store(static_cast<int>(g_texturePathMap.size()));
+            if (g_texturePathMap)
+                g_totalTexturesToLoad.store(static_cast<int>(g_texturePathMap->size()));
 
             if (g_totalTexturesToLoad.load() == 0)
             {
@@ -631,33 +677,39 @@ namespace ngg
             }
 
             // Start worker threads
-            for (DWORD i = 0; i < NUM_WORKER_THREADS; i++)
+            if (g_workerThreads)
             {
-                g_workerThreads.emplace_back(IOCPWorkerThread);
+                for (DWORD i = 0; i < NUM_WORKER_THREADS; i++)
+                {
+                    g_workerThreads->emplace_back(IOCPWorkerThread);
+                }
             }
 
             asi_log::Log("CustomTextureLoader: Started %d IOCP worker threads", NUM_WORKER_THREADS);
 
             // Post texture loading requests to IOCP queue
             int requestsPosted = 0;
-            for (const auto& [hash, path] : g_texturePathMap)
+            if (g_texturePathMap)
             {
-                // CRITICAL: Pass POINTER to device pointer, not the device itself!
-                // This matches the original ASI - workers dereference at load time to get CURRENT device
-                // This prevents crashes if the device is released/reset between post and load
-                TextureLoadRequest* request = new TextureLoadRequest{
-                    hash, path, const_cast<IDirect3DDevice9**>(&g_d3dDevice)
-                };
+                for (const auto& [hash, path] : *g_texturePathMap)
+                {
+                    // CRITICAL: Pass POINTER to device pointer, not the device itself!
+                    // This matches the original ASI - workers dereference at load time to get CURRENT device
+                    // This prevents crashes if the device is released/reset between post and load
+                    TextureLoadRequest* request = new TextureLoadRequest{
+                        hash, path, const_cast<IDirect3DDevice9**>(&g_d3dDevice)
+                    };
 
-                // Post to IOCP queue
-                if (!PostQueuedCompletionStatus(g_iocp, 0, reinterpret_cast<ULONG_PTR>(request), nullptr))
-                {
-                    asi_log::Log("CustomTextureLoader: Failed to post request for hash 0x%08X", hash);
-                    delete request;
-                }
-                else
-                {
-                    requestsPosted++;
+                    // Post to IOCP queue
+                    if (!PostQueuedCompletionStatus(g_iocp, 0, reinterpret_cast<ULONG_PTR>(request), nullptr))
+                    {
+                        asi_log::Log("CustomTextureLoader: Failed to post request for hash 0x%08X", hash);
+                        delete request;
+                    }
+                    else
+                    {
+                        requestsPosted++;
+                    }
                 }
             }
 
@@ -894,13 +946,16 @@ namespace ngg
         };
 
         // Map from hash to custom texture info
-        std::unordered_map<uint32_t, CustomTextureInfo> g_hashToCustomTextureMap;
+        // Use pointer to avoid destructor during CRT shutdown
+        std::unordered_map<uint32_t, CustomTextureInfo>* g_hashToCustomTextureMap = nullptr;
 
         // Map from game D3D texture pointer to hash (reverse lookup)
         // This is populated in HookGetTextureInfo when the game loads textures
-        std::unordered_map<IDirect3DTexture9*, uint32_t> g_gameTextureToHash;
+        // Use pointer to avoid destructor during CRT shutdown
+        std::unordered_map<IDirect3DTexture9*, uint32_t>* g_gameTextureToHash = nullptr;
 
-        std::mutex g_d3dSwapMutex;
+        CRITICAL_SECTION g_d3dSwapMutex;
+        bool g_d3dSwapMutexInitialized = false;
 
         // Flag to disable hook during shutdown to prevent crashes
         std::atomic<bool> g_hookEnabled{true};
@@ -921,18 +976,19 @@ namespace ngg
             IDirect3DTexture9* customTexture = nullptr;
             uint32_t hash = 0;
 
+            if (g_gameTextureToHash && g_hashToCustomTextureMap)
             {
-                std::lock_guard<std::mutex> lock(g_d3dSwapMutex);
+                EnterCriticalSection(&g_d3dSwapMutex);
 
                 // Step 1: Look up which hash this game texture corresponds to
-                auto hashIt = g_gameTextureToHash.find(gameTexture);
-                if (hashIt != g_gameTextureToHash.end())
+                auto hashIt = g_gameTextureToHash->find(gameTexture);
+                if (hashIt != g_gameTextureToHash->end())
                 {
                     hash = hashIt->second;
 
                     // Step 2: Look up custom texture by hash
-                    auto texIt = g_hashToCustomTextureMap.find(hash);
-                    if (texIt != g_hashToCustomTextureMap.end())
+                    auto texIt = g_hashToCustomTextureMap->find(hash);
+                    if (texIt != g_hashToCustomTextureMap->end())
                     {
                         // Step 3: Check if texture type matches the stage
                         const CustomTextureInfo& info = texIt->second;
@@ -942,6 +998,8 @@ namespace ngg
                         }
                     }
                 }
+
+                LeaveCriticalSection(&g_d3dSwapMutex);
             }
 
             // If we have a custom texture, use it instead
@@ -964,20 +1022,36 @@ namespace ngg
         // Determine texture type from hash by looking up the path
         TextureType GetTextureTypeFromHash(uint32_t hash)
         {
-            std::lock_guard<std::mutex> lock(g_textureMutex);
-            auto it = g_texturePathMap.find(hash);
-            if (it != g_texturePathMap.end())
+            if (!g_texturePathMap)
+                return TextureType::Unknown;
+
+            EnterCriticalSection(&g_textureMutex);
+            auto it = g_texturePathMap->find(hash);
+            if (it != g_texturePathMap->end())
             {
                 const std::string& path = it->second;
                 // Check the last characters before .dds extension
                 if (path.length() >= 6)
                 {
                     std::string suffix = path.substr(path.length() - 6, 2);  // Get "_X" before ".dds"
-                    if (suffix == "_D") return TextureType::Diffuse;
-                    if (suffix == "_N") return TextureType::Normal;
-                    if (suffix == "_S") return TextureType::Specular;
+                    if (suffix == "_D")
+                    {
+                        LeaveCriticalSection(&g_textureMutex);
+                        return TextureType::Diffuse;
+                    }
+                    if (suffix == "_N")
+                    {
+                        LeaveCriticalSection(&g_textureMutex);
+                        return TextureType::Normal;
+                    }
+                    if (suffix == "_S")
+                    {
+                        LeaveCriticalSection(&g_textureMutex);
+                        return TextureType::Specular;
+                    }
                 }
             }
+            LeaveCriticalSection(&g_textureMutex);
             return TextureType::Unknown;
         }
 
@@ -994,35 +1068,37 @@ namespace ngg
 
             // If we got a valid TextureInfo, check if we have a custom texture for this hash
             // Note: TextureInfo::Invalid is (TextureInfo*)-1 according to ExtendedCustomization SDK
-            if (textureInfo && textureInfo != reinterpret_cast<TextureInfo*>(-1) && textureInfo->PlatInfo)
+            if (textureInfo && textureInfo != reinterpret_cast<TextureInfo*>(-1) && textureInfo->PlatInfo && g_textureMap)
             {
                 // Check if we have a custom texture for this hash
                 IDirect3DTexture9* customTexture = nullptr;
                 {
-                    std::lock_guard<std::mutex> lock(g_textureMutex);
-                    auto it = g_textureMap.find(hash);
-                    if (it != g_textureMap.end())
+                    EnterCriticalSection(&g_textureMutex);
+                    auto it = g_textureMap->find(hash);
+                    if (it != g_textureMap->end())
                     {
                         customTexture = it->second;
                     }
+                    LeaveCriticalSection(&g_textureMutex);
                 }
 
                 // If we have a custom texture, add mapping from hash to custom texture
                 // ONLY if the hash corresponds to a valid game texture
-                if (customTexture && textureInfo->PlatInfo->pD3DTexture && IsValidGameTextureHash(hash))
+                if (customTexture && textureInfo->PlatInfo->pD3DTexture && IsValidGameTextureHash(hash) &&
+                    g_hashToCustomTextureMap && g_gameTextureToHash)
                 {
                     // Determine texture type from filename
                     TextureType type = GetTextureTypeFromHash(hash);
 
-                    std::lock_guard<std::mutex> lock(g_d3dSwapMutex);
+                    EnterCriticalSection(&g_d3dSwapMutex);
 
                     // Store the mapping from hash to custom texture
                     CustomTextureInfo info{customTexture, type};
-                    g_hashToCustomTextureMap[hash] = info;
+                    (*g_hashToCustomTextureMap)[hash] = info;
 
                     // Track which hash this game D3D texture corresponds to
                     // This gets updated every time the game loads a texture
-                    g_gameTextureToHash[textureInfo->PlatInfo->pD3DTexture] = hash;
+                    (*g_gameTextureToHash)[textureInfo->PlatInfo->pD3DTexture] = hash;
 
                     static std::atomic<int> mapCount{0};
                     int count = mapCount.fetch_add(1) + 1;
@@ -1034,6 +1110,8 @@ namespace ngg
                         asi_log::Log("CustomTextureLoader: Mapped (game texture %p, hash 0x%08X, type=%s) -> custom texture %p",
                                    textureInfo->PlatInfo->pD3DTexture, hash, typeStr, customTexture);
                     }
+
+                    LeaveCriticalSection(&g_d3dSwapMutex);
                 }
                 else if (customTexture && !IsValidGameTextureHash(hash))
                 {
@@ -1168,7 +1246,7 @@ namespace ngg
             // IOCP loading is started from SetD3DDevice() where we have a valid device pointer.
             // Hook 1 is called when graphics settings change, which might happen before device creation.
 
-            asi_log::Log("CustomTextureLoader: Texture paths re-parsed - %d textures found", g_texturePathMap.size());
+            asi_log::Log("CustomTextureLoader: Texture paths re-parsed - %d textures found", g_texturePathMap->size());
         }
 
         // Hook 1: Parse texture paths (called when graphics settings change)
@@ -1208,19 +1286,19 @@ namespace ngg
         }
 
         // These allow the override feature to patch the texture map when TexWizard collisions are detected
-        std::unordered_map<uint32_t, IDirect3DTexture9*>& GetTextureMap()
+        std::unordered_map<uint32_t, IDirect3DTexture9*>* GetTextureMap()
         {
             return g_textureMap;
         }
 
-        std::unordered_map<uint32_t, std::string>& GetTexturePathMap()
+        std::unordered_map<uint32_t, std::string>* GetTexturePathMap()
         {
             return g_texturePathMap;
         }
 
-        std::mutex& GetTextureMutex()
+        CRITICAL_SECTION* GetTextureMutex()
         {
-            return g_textureMutex;
+            return &g_textureMutex;
         }
     }
 }
@@ -1278,7 +1356,7 @@ void CustomTextureLoader::SetD3DDevice(IDirect3DDevice9* device)
     if (firstCall)
     {
         firstCall = false;
-        size_t textureCount = ngg::carbon::g_texturePathMap.size();
+        size_t textureCount = ngg::carbon::g_texturePathMap->size();
         asi_log::Log("CustomTextureLoader: Starting IOCP loading (%d textures)...", textureCount);
         ngg::carbon::StartIOCPLoading(device);
     }
@@ -1287,9 +1365,40 @@ void CustomTextureLoader::SetD3DDevice(IDirect3DDevice9* device)
 // Enable feature (install hooks)
 void CustomTextureLoader::enable()
 {
+    Feature::enable();
+
     asi_log::Log("CustomTextureLoader: Installing hooks...");
 
-    // Initialize MinHook
+    // Initialize critical sections (never deleted - OS cleans up on process exit)
+    if (!ngg::carbon::g_mutexesInitialized)
+    {
+        InitializeCriticalSection(&ngg::carbon::g_textureMutex);
+        InitializeCriticalSection(&ngg::carbon::g_d3dxMutex);
+        ngg::carbon::g_mutexesInitialized = true;
+    }
+    if (!ngg::carbon::g_d3dSwapMutexInitialized)
+    {
+        InitializeCriticalSection(&ngg::carbon::g_d3dSwapMutex);
+        ngg::carbon::g_d3dSwapMutexInitialized = true;
+    }
+
+    // Initialize heap-allocated containers (never deleted - OS cleans up on process exit)
+    if (!ngg::carbon::g_texturePathMap)
+        ngg::carbon::g_texturePathMap = new std::unordered_map<uint32_t, std::string>();
+    if (!ngg::carbon::g_textureMap)
+        ngg::carbon::g_textureMap = new std::unordered_map<uint32_t, IDirect3DTexture9*>();
+    if (!ngg::carbon::g_volumeTextureMap)
+        ngg::carbon::g_volumeTextureMap = new std::unordered_map<uint32_t, IDirect3DVolumeTexture9*>();
+    if (!ngg::carbon::g_loggedGenericTextures)
+        ngg::carbon::g_loggedGenericTextures = new std::unordered_set<uint32_t>();
+    if (!ngg::carbon::g_workerThreads)
+        ngg::carbon::g_workerThreads = new std::vector<std::thread>();
+    if (!ngg::carbon::g_hashToCustomTextureMap)
+        ngg::carbon::g_hashToCustomTextureMap = new std::unordered_map<uint32_t, ngg::carbon::CustomTextureInfo>();
+    if (!ngg::carbon::g_gameTextureToHash)
+        ngg::carbon::g_gameTextureToHash = new std::unordered_map<IDirect3DTexture9*, uint32_t>();
+
+    // Initialize MinHook (already done in dllmain.cpp, but check anyway)
     MH_STATUS status = MH_Initialize();
     if (status != MH_OK && status != MH_ERROR_ALREADY_INITIALIZED)
     {
@@ -1300,35 +1409,6 @@ void CustomTextureLoader::enable()
 
     // Install Hook 1: Load all textures (called when graphics settings change)
     // NOTE: Carbon doesn't have HOOK_LOAD_ADDR (nullsub equivalent not found)
-    if (ngg::carbon::HOOK_LOAD_ADDR != 0)
-    {
-        status = MH_CreateHook(
-            (LPVOID)ngg::carbon::HOOK_LOAD_ADDR,
-            (LPVOID)&ngg::carbon::HookLoad,
-            (LPVOID*)&ngg::carbon::g_originalHookLoad
-        );
-
-        if (status != MH_OK)
-        {
-            asi_log::Log("CustomTextureLoader: ERROR - Hook 1 creation failed: %s", MH_StatusToString(status));
-        }
-        else
-        {
-            status = MH_EnableHook((LPVOID)ngg::carbon::HOOK_LOAD_ADDR);
-            if (status != MH_OK)
-            {
-                asi_log::Log("CustomTextureLoader: ERROR - Hook 1 enable failed: %s", MH_StatusToString(status));
-            }
-            else
-            {
-                asi_log::Log("CustomTextureLoader: Hook 1 installed at 0x%X", ngg::carbon::HOOK_LOAD_ADDR);
-            }
-        }
-    }
-    else
-    {
-        asi_log::Log("CustomTextureLoader: Hook 1 skipped (address not found - Carbon build?)");
-    }
 
     // Install Hook 2: TextureInfo::Get hook for texture swapping
     // CRITICAL: This is the CORRECT approach for Carbon!
@@ -1366,7 +1446,7 @@ void CustomTextureLoader::enable()
     asi_log::Log("CustomTextureLoader: Parsing texture paths at startup...");
     ngg::carbon::ParseTexturePaths();
     asi_log::Log("CustomTextureLoader: Texture path parsing complete - %d textures found",
-                 ngg::carbon::g_texturePathMap.size());
+                 ngg::carbon::g_texturePathMap->size());
 
     // NOTE: BuildGameTextureMap() is called during first world rendering
     // when textures are actually loaded in memory (not at startup)
@@ -1378,38 +1458,64 @@ void CustomTextureLoader::enable()
 // Disable feature (cleanup)
 void CustomTextureLoader::disable()
 {
+    Feature::disable();
+
+    // CRITICAL: If we're shutting down (DLL unload), skip ALL cleanup!
+    if (ngg::carbon::g_isShuttingDown)
+    {
+        asi_log::Log("CustomTextureLoader: Skipping cleanup (DLL unload in progress)");
+        return;
+    }
+
     // Stop IOCP worker threads
     asi_log::Log("CustomTextureLoader: Stopping IOCP worker threads...");
     ngg::carbon::StopIOCPWorkers();
 
-    // Disable MinHook hooks
+    // Wait a bit for any in-flight operations to complete
+    Sleep(100);
+
+    // Disable MinHook hooks (only if NOT shutting down)
     asi_log::Log("CustomTextureLoader: Disabling MinHook hooks...");
     MH_DisableHook(MH_ALL_HOOKS);
-    MH_Uninitialize();
 
-    // Release all textures and texture_info structures
+    // Wait a bit for hooks to finish executing
+    Sleep(100);
+
+    // Release all textures (only if D3D device is still valid and NOT shutting down)
+    if (ngg::carbon::g_d3dDevice != nullptr && ngg::carbon::g_textureMap && ngg::carbon::g_volumeTextureMap)
     {
-        std::lock_guard<std::mutex> lock(ngg::carbon::g_textureMutex);
+        EnterCriticalSection(&ngg::carbon::g_textureMutex);
 
         // Release 2D textures
-        for (auto& pair : ngg::carbon::g_textureMap)
+        for (auto& pair : *ngg::carbon::g_textureMap)
         {
             if (pair.second)
                 pair.second->Release();
         }
-        ngg::carbon::g_textureMap.clear();
+        ngg::carbon::g_textureMap->clear();
 
         // Release volume textures
-        for (auto& pair : ngg::carbon::g_volumeTextureMap)
+        for (auto& pair : *ngg::carbon::g_volumeTextureMap)
         {
             if (pair.second)
                 pair.second->Release();
         }
-        ngg::carbon::g_volumeTextureMap.clear();
+        ngg::carbon::g_volumeTextureMap->clear();
+
+        LeaveCriticalSection(&ngg::carbon::g_textureMutex);
+
+        asi_log::Log("CustomTextureLoader: Released all D3D9 textures");
     }
 
-    ngg::carbon::g_texturePathMap.clear();
+    if (ngg::carbon::g_texturePathMap)
+        ngg::carbon::g_texturePathMap->clear();
     ngg::carbon::g_pathsLoaded = false;
+
+    // NOTE: We intentionally DO NOT:
+    // - Delete critical sections (causes CRT crash during DLL unload)
+    // - Delete heap-allocated containers (causes destructor crashes during shutdown)
+    // - Call MH_Uninitialize() (done in dllmain.cpp)
+    // The OS will clean up all memory when the process exits.
 
     asi_log::Log("CustomTextureLoader: Disabled");
 }
@@ -1424,9 +1530,24 @@ IDirect3DBaseTexture9* CustomTextureLoader::OnSetTexture(IDirect3DBaseTexture9* 
     return nullptr;
 }
 
+// Set shutdown flag (called from DllMain during DLL_PROCESS_DETACH)
+void CustomTextureLoader::SetShuttingDown()
+{
+    ngg::carbon::g_isShuttingDown = true;
+}
+
 // Called from DllMain on DLL_PROCESS_DETACH to clean up before exit
 void CustomTextureLoader::Cleanup()
 {
+    // CRITICAL: If we're shutting down (DLL unload), skip ALL cleanup!
+    // During DLL unload, the CRT and D3D are being torn down, and ANY cleanup
+    // operations (even texture->Release()) can trigger STATUS_STACK_BUFFER_OVERRUN.
+    if (ngg::carbon::g_isShuttingDown)
+    {
+        asi_log::Log("CustomTextureLoader: Skipping cleanup (DLL unload in progress)");
+        return;
+    }
+
     asi_log::Log("CustomTextureLoader: Cleanup - disabling hook and clearing caches");
 
     // Disable the hook to prevent crashes during shutdown
@@ -1434,9 +1555,12 @@ void CustomTextureLoader::Cleanup()
 
     // Clear the hash->custom texture mapping and game texture->hash mapping
     {
-        std::lock_guard<std::mutex> lock(ngg::carbon::g_d3dSwapMutex);
-        ngg::carbon::g_hashToCustomTextureMap.clear();
-        ngg::carbon::g_gameTextureToHash.clear();
+        EnterCriticalSection(&ngg::carbon::g_d3dSwapMutex);
+        if (ngg::carbon::g_hashToCustomTextureMap)
+            ngg::carbon::g_hashToCustomTextureMap->clear();
+        if (ngg::carbon::g_gameTextureToHash)
+            ngg::carbon::g_gameTextureToHash->clear();
+        LeaveCriticalSection(&ngg::carbon::g_d3dSwapMutex);
     }
 
     asi_log::Log("CustomTextureLoader: Cleanup complete");

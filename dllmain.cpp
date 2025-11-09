@@ -7,6 +7,7 @@
 #include "features.h"
 #include "CustomTextureLoader.h"
 #include "WriteProtectScope.h"
+#include "minhook/include/MinHook.h"
 
 using namespace ngg::carbon;
 
@@ -165,6 +166,9 @@ HRESULT APIENTRY HookedPresent(IDirect3DDevice9* device, CONST RECT* src, CONST 
         }
     }
 
+    // DEBUG: Log what we're about to call
+    asi_log::Log("HookedPresent: About to call g_originalPresent = %p with device = %p\n", g_originalPresent, device);
+
     // Call the original Present if we have it; fallback safe behavior if not
     if (g_originalPresent)
         return g_originalPresent(device, src, dest, wnd, dirty);
@@ -232,6 +236,8 @@ void HookPresent()
     // Save original Present (index 17)
     void* originalPtr = deviceVTable[17];
     g_originalPresent = reinterpret_cast<PresentFn>(originalPtr);
+
+    asi_log::Log("HookPresent: deviceVTable = %p, deviceVTable[17] = %p\n", deviceVTable, originalPtr);
 
     // Install Present hook
     if (MakeVTableHook(deviceVTable, 17, reinterpret_cast<void*>(&HookedPresent), &g_savedOriginalPtr))
@@ -315,6 +321,15 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
     {
         DisableThreadLibraryCalls(hModule);
 
+        // Initialize MinHook FIRST (before any hooks are installed)
+        MH_STATUS status = MH_Initialize();
+        if (status != MH_OK && status != MH_ERROR_ALREADY_INITIALIZED)
+        {
+            asi_log::Log("DllMain: Failed to initialize MinHook: %s\n", MH_StatusToString(status));
+            return FALSE;
+        }
+        asi_log::Log("DllMain: MinHook initialized successfully\n");
+
         CreateThread(nullptr, 0, [](LPVOID) -> DWORD
         {
             HookPresent(); // install vtable patching on a background thread
@@ -323,20 +338,26 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
     }
     else if (reason == DLL_PROCESS_DETACH)
     {
-        // NOTE: We don't call feature->disable() here because:
-        // 1. The game may have already destroyed D3D resources
-        // 2. Calling Release() on already-freed D3D objects causes crashes
-        // 3. When the process exits, the OS cleans up all resources anyway
-        // 4. The original ASI doesn't do cleanup on exit either
-        //
-        // If we need to support runtime DLL unloading (hot reload), we would need
-        // to add proper NULL checks and error handling in all disable() methods.
+        // CRITICAL: Set shutdown flag FIRST to prevent any cleanup operations
+        // During DLL unload, the CRT and D3D are being torn down, and ANY cleanup
+        // operations (even texture->Release()) can trigger STATUS_STACK_BUFFER_OVERRUN.
+        CustomTextureLoader::SetShuttingDown();
 
-        // Clean up CustomTextureLoader to prevent crashes during shutdown
+        // Wait a bit for any in-flight operations to complete
+        Sleep(100);
+
+        // Clear features vector (this calls disable() on each feature, which will skip cleanup due to shutdown flag)
+        g_features.clear();
+
+        // Clean up CustomTextureLoader (will skip cleanup due to shutdown flag)
         CustomTextureLoader::Cleanup();
 
         // Unhook Present (this is safe because we control the vtable)
         UnhookPresent();
+
+        // Uninitialize MinHook LAST (after all hooks are removed)
+        MH_Uninitialize();
+        asi_log::Log("DllMain: MinHook uninitialized\n");
     }
 
     return TRUE;

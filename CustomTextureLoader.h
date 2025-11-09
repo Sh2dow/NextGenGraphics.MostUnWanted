@@ -26,5 +26,8 @@ public:
 
     // Called from DllMain on DLL_PROCESS_DETACH to clean up
     static void Cleanup();
+
+    // Called from DllMain on DLL_PROCESS_DETACH to set shutdown flag
+    static void SetShuttingDown();
 };
 
