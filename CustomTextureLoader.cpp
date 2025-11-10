@@ -145,8 +145,19 @@ namespace
 
     // Optimization: Reserve capacity for expected texture count (1000-2000+)
     constexpr size_t EXPECTED_TEXTURE_COUNT = 2000;
-    constexpr DWORD NUM_WORKER_THREADS = 4; // Number of IOCP worker threads
+    
+    // Dynamic IOCP worker thread count based on CPU cores
+    // Use all available cores for maximum loading speed
+    inline DWORD GetOptimalWorkerThreadCount()
+    {
+        SYSTEM_INFO sysInfo;
+        GetSystemInfo(&sysInfo);
+        DWORD numCores = sysInfo.dwNumberOfProcessors;
 
+        // Use all cores, minimum 2, maximum 16 (reasonable limit)
+        return max(2, min(numCores, 16));
+    }
+    
     // Optimization: Track directory modification time to avoid re-parsing unchanged JSON
     fs::file_time_type g_lastDirModTime;
 
@@ -529,6 +540,11 @@ namespace
     // Matches original ASI behavior: uses IOCP thread pool for asynchronous loading
     void IOCPWorkerThread()
     {
+        // Boost thread priority during texture loading for faster startup
+        HANDLE currentThread = GetCurrentThread();
+        int originalPriority = GetThreadPriority(currentThread);
+        SetThreadPriority(currentThread, THREAD_PRIORITY_ABOVE_NORMAL);
+
         while (!g_stopLoading.load())
         {
             DWORD bytesTransferred = 0;
@@ -625,6 +641,9 @@ namespace
                 delete request;
             }
         }
+        
+        // Restore original thread priority before exiting
+        SetThreadPriority(currentThread, originalPriority);
     }
 
     // Stop IOCP worker threads
@@ -692,8 +711,11 @@ namespace
             return;
         }
 
-        // Create IOCP
-        g_iocp = CreateIoCompletionPort(INVALID_HANDLE_VALUE, nullptr, 0, NUM_WORKER_THREADS);
+        // Get optimal thread count based on CPU cores
+        DWORD numWorkerThreads = GetOptimalWorkerThreadCount();
+
+        // Create IOCP with dynamic thread count
+        g_iocp = CreateIoCompletionPort(INVALID_HANDLE_VALUE, nullptr, 0, numWorkerThreads);
         if (!g_iocp)
         {
             asi_log::Log("CustomTextureLoader: Failed to create IOCP!");
@@ -703,13 +725,14 @@ namespace
         // Start worker threads
         if (g_workerThreads)
         {
-            for (DWORD i = 0; i < NUM_WORKER_THREADS; i++)
+            for (DWORD i = 0; i < numWorkerThreads; i++)
             {
                 g_workerThreads->emplace_back(IOCPWorkerThread);
             }
         }
 
-        asi_log::Log("CustomTextureLoader: Started %d IOCP worker threads", NUM_WORKER_THREADS);
+        asi_log::Log("CustomTextureLoader: Started %d IOCP worker threads (CPU cores: %d)",
+                   numWorkerThreads, numWorkerThreads);
 
         // Post texture loading requests to IOCP queue
         int requestsPosted = 0;
