@@ -206,7 +206,6 @@
         <ClCompile Include="TextureLoaderAsync.cpp" />
         <ClCompile Include="TexturePathParser.cpp" />
         <ClCompile Include="TPFLoader.cpp" />
-        <ClCompile Include="TPFLoader_Integration_Example.cpp" />
         <ClCompile Include="WriteProtectScope.h" />
         <ClCompile Include="includes\miniz\miniz.c" />
         <ClCompile Include="includes\miniz\miniz_tdef.c" />

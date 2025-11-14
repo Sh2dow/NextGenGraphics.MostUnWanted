@@ -7,10 +7,10 @@
 // Optional STATIC CRC32 cache (compile-time), like GameTextureHashes.h
 // If present, we prefer it over the JSON file at runtime.
 #if defined(__has_include)
-#  if __has_include("../HashMaps/MW_CRC32Cache_Static.h")
-#    include "../HashMaps/MW_CRC32Cache_Static.h"
-#    define NGG_HAVE_STATIC_CRC32_CACHE 1
-#  endif
+#if __has_include("../HashMaps/MW_CRC32Cache_Static.h")
+#include "../HashMaps/MW_CRC32Cache_Static.h"
+#define NGG_HAVE_STATIC_CRC32_CACHE 1
+#endif
 #endif
 #ifndef NGG_HAVE_STATIC_CRC32_CACHE
 #  define NGG_HAVE_STATIC_CRC32_CACHE 0
