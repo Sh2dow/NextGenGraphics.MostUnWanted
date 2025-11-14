@@ -13,6 +13,7 @@ namespace asi_log
     public:
         Logger()
         {
+            // log_file_.open("scripts\\shaderlog.txt", std::ios::app);
         }
 
         ~Logger()
@@ -30,7 +31,7 @@ namespace asi_log
             vsnprintf_s(buffer, sizeof(buffer), fmt, args);
             va_end(args);
 
-            std::string message = std::string("[NextGenGraphics.MostWanted] ") + buffer;
+            std::string message = std::string("[NextGenGraphics.TextureLoader] ") + buffer;
 
             {
                 std::lock_guard<std::mutex> lock(mutex_);

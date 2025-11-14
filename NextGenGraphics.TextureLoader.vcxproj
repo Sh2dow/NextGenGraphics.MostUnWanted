@@ -1,0 +1,235 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" ToolsVersion="15.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+    <ItemGroup Label="ProjectConfigurations">
+        <ProjectConfiguration Include="Debug_MW|Win32">
+            <Configuration>Debug_MW</Configuration>
+            <Platform>Win32</Platform>
+        </ProjectConfiguration>
+        <ProjectConfiguration Include="Release_MW|Win32">
+            <Configuration>Release_MW</Configuration>
+            <Platform>Win32</Platform>
+        </ProjectConfiguration>
+        <ProjectConfiguration Include="Debug_NFSC|Win32">
+            <Configuration>Debug_NFSC</Configuration>
+            <Platform>Win32</Platform>
+        </ProjectConfiguration>
+        <ProjectConfiguration Include="Release_NFSC|Win32">
+            <Configuration>Release_NFSC</Configuration>
+            <Platform>Win32</Platform>
+        </ProjectConfiguration>
+    </ItemGroup>
+    <PropertyGroup Label="Globals">
+        <ProjectGuid>{e8e260a3-65fb-48b9-a739-ca47eaf9603e}</ProjectGuid>
+        <Keyword>Win32Proj</Keyword>
+        <RootNamespace>NextGenGraphics.TextureLoader</RootNamespace>
+        <ProjectName>NextGenGraphics.TextureLoader</ProjectName>
+        <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
+        <PlatformToolset>v143</PlatformToolset>
+        <ConfigurationType>DynamicLibrary</ConfigurationType>
+    </PropertyGroup>
+    <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props"/>
+
+    <PropertyGroup Label="Configuration" Condition="'$(Configuration)|$(Platform)'=='Debug_MW|Win32'">
+        <UseDebugLibraries>true</UseDebugLibraries>
+        <CharacterSet>Unicode</CharacterSet>
+    </PropertyGroup>
+    <PropertyGroup Label="Configuration" Condition="'$(Configuration)|$(Platform)'=='Release_MW|Win32'">
+        <UseDebugLibraries>false</UseDebugLibraries>
+        <CharacterSet>Unicode</CharacterSet>
+    </PropertyGroup>
+    <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props"/>
+    <ImportGroup Label="ExtensionSettings">
+    </ImportGroup>
+    <ImportGroup Label="PropertySheets">
+        <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform"/>
+    </ImportGroup>
+    <PropertyGroup Label="UserMacros"/>
+    <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug_MW|Win32'">
+        <LinkIncremental>true</LinkIncremental>
+        <TargetExt>.asi</TargetExt>
+        <OutDir>$(SolutionDir)$(Configuration)\scripts\</OutDir>
+        <TargetName>NextGenGraphics.MostWanted</TargetName>
+    </PropertyGroup>
+    <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release_MW|Win32'">
+        <LinkIncremental>false</LinkIncremental>
+        <WholeProgramOptimization>true</WholeProgramOptimization>
+        <TargetExt>.asi</TargetExt>
+        <OutDir>$(SolutionDir)\$(Configuration)\scripts\</OutDir>
+        <IntDir>obj\Win32\$(Configuration)\</IntDir>
+        <TargetName>NextGenGraphics.MostWanted</TargetName>
+    </PropertyGroup>
+
+    <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug_NFSC|Win32'">
+        <LinkIncremental>true</LinkIncremental>
+        <TargetExt>.asi</TargetExt>
+        <OutDir>$(SolutionDir)$(Configuration)\scripts\</OutDir>
+        <IntDir>obj\Win32\$(Configuration)\$(Configuration)\</IntDir>
+        <TargetName>NextGenGraphics.Carbon</TargetName>
+    </PropertyGroup>
+    <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release_NFSC|Win32'">
+        <LinkIncremental>false</LinkIncremental>
+        <WholeProgramOptimization>true</WholeProgramOptimization>
+        <TargetExt>.asi</TargetExt>
+        <OutDir>$(SolutionDir)$(Configuration)\scripts\</OutDir>
+        <IntDir>obj\Win32\$(Configuration)\$(Configuration)\</IntDir>
+        <TargetName>NextGenGraphics.Carbon</TargetName>
+    </PropertyGroup>
+    
+    <PropertyGroup Label="Configuration" Condition="'$(Configuration)|$(Platform)'=='Debug_NFSC|Win32'">
+        <UseDebugLibraries>true</UseDebugLibraries>
+        <CharacterSet>Unicode</CharacterSet>
+    </PropertyGroup>
+    <PropertyGroup Label="Configuration" Condition="'$(Configuration)|$(Platform)'=='Release_NFSC|Win32'">
+        <UseDebugLibraries>false</UseDebugLibraries>
+        <CharacterSet>Unicode</CharacterSet>
+    </PropertyGroup>
+    <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props"/>
+    <ImportGroup Label="ExtensionSettings">
+    </ImportGroup>
+    <ImportGroup Label="PropertySheets">
+        <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform"/>
+    </ImportGroup>
+    <PropertyGroup Label="UserMacros"/>
+
+    <ItemDefinitionGroup>
+        <ClCompile>
+            <LanguageStandard>stdcpp17</LanguageStandard>
+            <AdditionalIncludeDirectories>
+                includes;includes\json\include;includes\spdlog\include;includes\miniz;
+                $(DXSDK_DIR)Include;%(AdditionalIncludeDirectories)
+            </AdditionalIncludeDirectories>
+        </ClCompile>
+        <Link>
+            <SubSystem>Windows</SubSystem>
+            <AdditionalLibraryDirectories>$(DXSDK_DIR)Lib\x86;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+            <AdditionalDependencies>d3d9.lib;d3dx9.lib;ws2_32.lib;crypt32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+        </Link>
+    </ItemDefinitionGroup>
+    
+    <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug_MW|Win32'">
+        <ClCompile>
+            <PrecompiledHeader>NotUsing</PrecompiledHeader>
+            <WarningLevel>Level3</WarningLevel>
+            <Optimization>Disabled</Optimization>
+            <PreprocessorDefinitions>GAME_MW;WIN32;_DEBUG;_WINDOWS;_USRDLL;_CRT_SECURE_NO_WARNINGS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+            <RuntimeLibrary>MultiThreadedDebug</RuntimeLibrary>
+        </ClCompile>
+        <Link>
+            <GenerateDebugInformation>true</GenerateDebugInformation>
+        </Link>
+    </ItemDefinitionGroup>
+    <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release_MW|Win32'">
+        <ClCompile>
+            <PrecompiledHeader>NotUsing</PrecompiledHeader>
+            <WarningLevel>Level4</WarningLevel>
+            <Optimization>MaxSpeed</Optimization>
+            <PreprocessorDefinitions>GAME_MW;WIN32;_RELEASE;_WINDOWS;_USRDLL;_CRT_SECURE_NO_WARNINGS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+            <FunctionLevelLinking>true</FunctionLevelLinking>
+            <IntrinsicFunctions>true</IntrinsicFunctions>
+            <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
+        </ClCompile>
+        <Link>
+            <GenerateDebugInformation>false</GenerateDebugInformation>
+            <EnableCOMDATFolding>true</EnableCOMDATFolding>
+            <OptimizeReferences>true</OptimizeReferences>
+        </Link>
+    </ItemDefinitionGroup>
+
+    <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug_NFSC|Win32'">
+        <ClCompile>
+            <PrecompiledHeader>NotUsing</PrecompiledHeader>
+            <WarningLevel>Level3</WarningLevel>
+            <Optimization>Disabled</Optimization>
+            <PreprocessorDefinitions>GAME_CARBON;WIN32;_DEBUG;_WINDOWS;_USRDLL;_CRT_SECURE_NO_WARNINGS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+            <RuntimeLibrary>MultiThreadedDebug</RuntimeLibrary>
+        </ClCompile>
+        <Link>
+            <GenerateDebugInformation>true</GenerateDebugInformation>
+        </Link>
+    </ItemDefinitionGroup>
+    <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release_NFSC|Win32'">
+        <ClCompile>
+            <PrecompiledHeader>NotUsing</PrecompiledHeader>
+            <WarningLevel>Level4</WarningLevel>
+            <Optimization>MaxSpeed</Optimization>
+            <PreprocessorDefinitions>GAME_CARBON;WIN32;_RELEASE;_WINDOWS;_USRDLL;_CRT_SECURE_NO_WARNINGS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+            <FunctionLevelLinking>true</FunctionLevelLinking>
+            <IntrinsicFunctions>true</IntrinsicFunctions>
+            <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
+        </ClCompile>
+        <Link>
+            <GenerateDebugInformation>false</GenerateDebugInformation>
+            <EnableCOMDATFolding>true</EnableCOMDATFolding>
+            <OptimizeReferences>true</OptimizeReferences>
+        </Link>
+    </ItemDefinitionGroup>
+
+    <ItemGroup>
+        <ClInclude Include="Core\CRC32Manager.h"/>
+        <ClInclude Include="Core\TextureHashTable.h"/>
+        <ClInclude Include="HashMaps\MW_CRC32Cache_Static.h" />
+        <ClInclude Include="CustomTextureHooks.h" />
+        <ClInclude Include="CustomTextureLoader.h" />
+        <ClInclude Include="features.h" />
+        <ClInclude Include="HashMaps\MW_GameTextureHashes.h" />
+        <ClInclude Include="includes\IniReader.h" />
+        <ClInclude Include="includes\minhook\include\MinHook.h" />
+        <ClInclude Include="includes\minhook\src\buffer.h" />
+        <ClInclude Include="includes\minhook\src\hde\hde32.h" />
+        <ClInclude Include="includes\minhook\src\hde\hde64.h" />
+        <ClInclude Include="includes\minhook\src\hde\pstdint.h" />
+        <ClInclude Include="includes\minhook\src\hde\table32.h" />
+        <ClInclude Include="includes\minhook\src\hde\table64.h" />
+        <ClInclude Include="includes\minhook\src\trampoline.h" />
+        <ClInclude Include="NFSMW_PreFEngHook.h" />
+        <ClInclude Include="Log.h" />
+        <ClInclude Include="TextureLoaderAsync.h" />
+        <ClInclude Include="TexturePathParser.h" />
+        <ClInclude Include="TextureSwapApply.h" />
+        <ClInclude Include="TextureSwapTable.h" />
+        <ClInclude Include="TPFLoader.h" />
+    </ItemGroup>
+    <ItemGroup>
+        <ClCompile Include="CustomTextureHooks.cpp" />
+        <ClCompile Include="CustomTextureLoader.cpp" />
+        <ClCompile Include="Core\TextureHashTable.cpp" />
+        <ClCompile Include="Core\CRC32Manager.cpp" />
+        <ClCompile Include="includes\minhook\src\buffer.c" />
+        <ClCompile Include="includes\minhook\src\hde\hde32.c" />
+        <ClCompile Include="includes\minhook\src\hde\hde64.c" />
+        <ClCompile Include="includes\minhook\src\hook.c" />
+        <ClCompile Include="includes\minhook\src\trampoline.c" />
+        <ClCompile Include="dllmain.cpp" />
+        <ClCompile Include="stdafx.h" />
+        <ClCompile Include="includes\log.h" />
+        <ClCompile Include="TextureSwapApply.cpp" />
+        <ClCompile Include="TextureLoaderAsync.cpp" />
+        <ClCompile Include="TexturePathParser.cpp" />
+        <ClCompile Include="TPFLoader.cpp" />
+        <ClCompile Include="TPFLoader_Integration_Example.cpp" />
+        <ClCompile Include="WriteProtectScope.h" />
+        <ClCompile Include="includes\miniz\miniz.c" />
+        <ClCompile Include="includes\miniz\miniz_tdef.c" />
+        <ClCompile Include="includes\miniz\miniz_tinfl.c" />
+        <ClCompile Include="includes\miniz\miniz_zip.c" />
+    </ItemGroup>
+    <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets"/>
+    <ImportGroup Label="ExtensionTargets"/>
+
+    <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug_MW|Win32' Or '$(Configuration)|$(Platform)'=='Release_MW|Win32'">
+        <PostBuildEvent>
+            <Command>
+                XCOPY /Y /R "$(TargetDir)*" "d:\Games\NFS MW - Vanilla\SCRIPTS\"
+            </Command>
+        </PostBuildEvent>
+    </ItemDefinitionGroup>
+
+    <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug_NFSC|Win32' Or '$(Configuration)|$(Platform)'=='Release_NFSC|Win32'">
+        <PostBuildEvent>
+            <Command>
+                start XCOPY /Y /R "$(TargetDir)*" "d:\Games\NFSC - Test\SCRIPTS\"
+            </Command>
+        </PostBuildEvent>
+    </ItemDefinitionGroup>
+    
+</Project>

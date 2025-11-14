@@ -1,6 +1,5 @@
 #pragma once
 
-// #include "Log.h"
 // REMOVED: This macro was breaking OutputDebugStringA calls during early initialization
 // #define OutputDebugStringA(...) asi_log::Log(__VA_ARGS__)
 

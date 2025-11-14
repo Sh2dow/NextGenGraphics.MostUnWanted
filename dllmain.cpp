@@ -1,16 +1,22 @@
-// Minimal reimplementation of the NextGenGraphics.MostWanted plugin.
+// Minimal reimplementation of the NextGenGraphics.TextureLoader plugin.
 #include <windows.h>
 #include <vector>
 #include <memory>
 #include <atomic>
-#include "NFSMW_PreFEngHook.h"
-#include "WriteProtectScope.h"
-#include "features.h"
-#include "CustomTextureLoader.h"
 #include "Log.h"
 #include "includes/minhook/include/MinHook.h"
+#include "features.h"
+#include "CustomTextureLoader.h"
+#include "WriteProtectScope.h"
 
+#ifdef GAME_MW
+#include "NFSMW_PreFEngHook.h"
 using namespace ngg::mw;
+#elif GAME_CARBON
+#include "NFSC_PreFEngHook.h"
+using namespace ngg::carbon;
+#endif
+
 
 // TODO: Port full initialization logic from sub_10077220
 static std::vector<std::unique_ptr<ngg::common::Feature>> g_features;
@@ -35,7 +41,6 @@ bool triedInit = false;
 static void Initialize()
 {
     using namespace ngg::mw::features;
-
     g_features.emplace_back(std::make_unique<CustomTextureLoader>());
 
     asi_log::Log("Setting up hooks\n");

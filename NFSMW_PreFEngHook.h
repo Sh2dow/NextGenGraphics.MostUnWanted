@@ -30,8 +30,7 @@ namespace ngg
         
         // Game addresses
         constexpr uintptr_t HOOK_LOAD_ADDR = 0x6C3A30;      // nullsub_33
-        constexpr uintptr_t HOOK_SWAP_ADDR = 0x6C6C8D;      // BEFORE epilogue of sub_6C68B0
-        constexpr uintptr_t GAME_GET_TEXTURE_INFO_ADDR = 0x00503400;
+        constexpr uintptr_t HOOK_SWAP_ADDR = 0x6C6C8D;      // BEFORE epilogue of sub_6C68B0 (original ASI hooks here!)
 
         // Game texture wrapper addresses
         constexpr uintptr_t GAME_TEX_WRAPPER_1 = 0x982CB4;  // Pointer to diffuse texture wrapper

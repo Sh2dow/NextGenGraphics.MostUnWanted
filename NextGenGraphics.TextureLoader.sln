@@ -1,0 +1,27 @@
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio 17
+VisualStudioVersion = 17.4.33122.133
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{A71AE580-B04B-488A-BA9C-A8394E8F5782}") = "NextGenGraphics.TextureLoader", "NextGenGraphics.TextureLoader.vcxproj", "{E8E260A3-65FB-48B9-A739-CA47EAF9603E}"
+EndProject
+Global
+				GlobalSection(SolutionConfigurationPlatforms) = preSolution
+								Debug_MW|Win32 = Debug_MW|Win32
+								Release_MW|Win32 = Release_MW|Win32
+								Debug_NFSC|Win32 = Debug_NFSC|Win32
+								Release_NFSC|Win32 = Release_NFSC|Win32
+				EndGlobalSection
+				GlobalSection(ProjectConfigurationPlatforms) = postSolution
+								{e8e260a3-65fb-48b9-a739-ca47eaf9603e}.Debug_MW|Win32.ActiveCfg = Debug_MW|Win32
+								{e8e260a3-65fb-48b9-a739-ca47eaf9603e}.Debug_MW|Win32.Build.0 = Debug_MW|Win32
+								{e8e260a3-65fb-48b9-a739-ca47eaf9603e}.Release_MW|Win32.ActiveCfg = Release_MW|Win32
+								{e8e260a3-65fb-48b9-a739-ca47eaf9603e}.Release_MW|Win32.Build.0 = Release_MW|Win32
+								{e8e260a3-65fb-48b9-a739-ca47eaf9603e}.Debug_NFSC|Win32.ActiveCfg = Debug_NFSC|Win32
+								{e8e260a3-65fb-48b9-a739-ca47eaf9603e}.Debug_NFSC|Win32.Build.0 = Debug_NFSC|Win32
+								{e8e260a3-65fb-48b9-a739-ca47eaf9603e}.Release_NFSC|Win32.ActiveCfg = Release_NFSC|Win32
+								{e8e260a3-65fb-48b9-a739-ca47eaf9603e}.Release_NFSC|Win32.Build.0 = Release_NFSC|Win32
+				EndGlobalSection
+				GlobalSection(SolutionProperties) = preSolution
+								HideSolutionNode = FALSE
+				EndGlobalSection
+EndGlobal
