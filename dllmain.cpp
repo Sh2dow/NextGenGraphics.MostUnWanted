@@ -246,6 +246,9 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
 
         CreateThread(nullptr, 0, [](LPVOID) -> DWORD
         {
+            // Wait for game to initialize before hooking Present
+            // This prevents crashes with other mods that expect game state to be ready
+            Sleep(1000); // 1 second delay to let game initialize
             HookPresent(); // install vtable patching on a background thread
             return 0;
         }, nullptr, 0, nullptr);
