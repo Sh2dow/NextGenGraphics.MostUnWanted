@@ -659,7 +659,7 @@ namespace ngg
                                 // Build the swap table (validates sizes and builds fast lookup)
                                 BuildSwapTable();
 
-                                asi_log::Log("CustomTextureLoader: Textures will be swapped via TextureInfo::Get hook as you drive around the world");
+                                asi_log::Log("CustomTextureLoader: Textures will be swapped via SetTexture hook as you drive around the world");
                             }
                         }
                     }
@@ -1215,6 +1215,14 @@ namespace ngg
                     customTexture->Release();
                     (*g_swapTable)[hash] = customTexture;
                     validatedTextures++;
+
+                    if (g_hashToCustomTextureMap)
+                    {
+                        CustomTextureInfo info{};
+                        info.texture = customTexture;
+                        info.type = GetTextureTypeFromHash(hash);
+                        (*g_hashToCustomTextureMap)[hash] = info;
+                    }
                 }
                 else
                 {
@@ -1231,70 +1239,43 @@ namespace ngg
                        totalCustomTextures, validatedTextures, invalidHashes);
         }
 
-        // Track which textures we've already swapped to avoid swapping multiple times
-        std::unordered_set<uint32_t>* g_swappedHashes = nullptr;
-
-        // Hook TextureInfo::Get to swap textures using the pre-built swap table
+        // Hook TextureInfo::Get to record hash mappings for SetTexture hook
         // Original function: TextureInfo* __cdecl Get(uint32_t hash, bool defaultIfNotFound, bool includeUnloaded)
+        static TextureInfo* SafeGameGetTextureInfo(uint32_t hash, bool defaultIfNotFound, bool includeUnloaded)
+        {
+            __try
+            {
+                return g_gameGetTextureInfo(hash, defaultIfNotFound, includeUnloaded);
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER)
+            {
+                static std::atomic<int> failCount{0};
+                int count = failCount.fetch_add(1) + 1;
+                if (count <= 5)
+                {
+                    asi_log::Log("CustomTextureLoader: GetTextureInfo crashed for hash=0x%08X, skipping (count=%d)",
+                               hash, count);
+                }
+                return reinterpret_cast<TextureInfo*>(-1);
+            }
+        }
+
         TextureInfo* __cdecl HookGetTextureInfo(uint32_t hash, bool defaultIfNotFound, bool includeUnloaded)
         {
             // Call original function to get the game's TextureInfo
-            TextureInfo* textureInfo = g_gameGetTextureInfo(hash, defaultIfNotFound, includeUnloaded);
+            TextureInfo* textureInfo = SafeGameGetTextureInfo(hash, defaultIfNotFound, includeUnloaded);
 
             // If hook is disabled (during shutdown), just return original
             if (!g_hookEnabled.load())
                 return textureInfo;
 
-            // If swap table is built, use it for fast lookup
-            if (g_swapTableBuilt.load() && g_swapTable && textureInfo &&
-                textureInfo != reinterpret_cast<TextureInfo*>(-1) && textureInfo->PlatInfo)
+            if (textureInfo && textureInfo != reinterpret_cast<TextureInfo*>(-1) &&
+                textureInfo->PlatInfo && textureInfo->PlatInfo->pD3DTexture &&
+                g_gameTextureToHash)
             {
-                EnterCriticalSection(&g_textureMutex);
-
-                // Check if we've already swapped this texture
-                if (!g_swappedHashes)
-                    g_swappedHashes = new std::unordered_set<uint32_t>();
-
-                // Only swap if we haven't swapped this hash before
-                if (g_swappedHashes->find(hash) == g_swappedHashes->end())
-                {
-                    auto it = g_swapTable->find(hash);
-                    if (it != g_swapTable->end())
-                    {
-                        // CRITICAL: Only swap if the custom texture is valid
-                        IDirect3DTexture9* customTexture = it->second;
-                        if (customTexture && customTexture != reinterpret_cast<IDirect3DTexture9*>(-1))
-                        {
-                            // DIRECT POINTER SWAP - just replace the D3D texture pointer ONCE
-                            textureInfo->PlatInfo->pD3DTexture = customTexture;
-
-                            // Mark this hash as swapped so we don't swap it again
-                            g_swappedHashes->insert(hash);
-
-                            // Log first 10 swaps
-                            static std::atomic<int> swapCount{0};
-                            int count = swapCount.fetch_add(1) + 1;
-                            if (count <= 10)
-                            {
-                                asi_log::Log("CustomTextureLoader: GetTextureInfo swap #%d - hash=0x%08X, swapped to %p (PERMANENT)",
-                                           count, hash, customTexture);
-                            }
-                        }
-                    }
-                }
-                else
-                {
-                    // Log first 10 re-access attempts to verify we're not re-swapping
-                    static std::atomic<int> reAccessCount{0};
-                    int count = reAccessCount.fetch_add(1) + 1;
-                    if (count <= 10)
-                    {
-                        asi_log::Log("CustomTextureLoader: GetTextureInfo re-access #%d - hash=0x%08X (already swapped, skipping)",
-                                   count, hash);
-                    }
-                }
-
-                LeaveCriticalSection(&g_textureMutex);
+                EnterCriticalSection(&g_d3dSwapMutex);
+                (*g_gameTextureToHash)[textureInfo->PlatInfo->pD3DTexture] = hash;
+                LeaveCriticalSection(&g_d3dSwapMutex);
             }
 
             return textureInfo;
@@ -1507,6 +1488,46 @@ void CustomTextureLoader::enable()
     Feature::enable();
 
     asi_log::Log("CustomTextureLoader: Installing hooks...");
+    {
+        HMODULE module = nullptr;
+        if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+                               reinterpret_cast<LPCSTR>(&ngg::carbon::HookGetTextureInfo),
+                               &module))
+        {
+            auto base = reinterpret_cast<uintptr_t>(module);
+            asi_log::Log("CustomTextureLoader: Module base=%p", module);
+            asi_log::Log("CustomTextureLoader: HookGetTextureInfo=%p (offset=0x%X)",
+                         reinterpret_cast<void*>(&ngg::carbon::HookGetTextureInfo),
+                         static_cast<unsigned>(reinterpret_cast<uintptr_t>(&ngg::carbon::HookGetTextureInfo) - base));
+            asi_log::Log("CustomTextureLoader: SafeGameGetTextureInfo=%p (offset=0x%X)",
+                         reinterpret_cast<void*>(&ngg::carbon::SafeGameGetTextureInfo),
+                         static_cast<unsigned>(reinterpret_cast<uintptr_t>(&ngg::carbon::SafeGameGetTextureInfo) - base));
+            asi_log::Log("CustomTextureLoader: OnSetTexture=%p (offset=0x%X)",
+                         reinterpret_cast<void*>(&CustomTextureLoader::OnSetTexture),
+                         static_cast<unsigned>(reinterpret_cast<uintptr_t>(&CustomTextureLoader::OnSetTexture) - base));
+            asi_log::Log("CustomTextureLoader: SetD3DDevice=%p (offset=0x%X)",
+                         reinterpret_cast<void*>(&CustomTextureLoader::SetD3DDevice),
+                         static_cast<unsigned>(reinterpret_cast<uintptr_t>(&CustomTextureLoader::SetD3DDevice) - base));
+            asi_log::Log("CustomTextureLoader: HookSetTexture=%p (offset=0x%X)",
+                         reinterpret_cast<void*>(&ngg::carbon::HookSetTexture),
+                         static_cast<unsigned>(reinterpret_cast<uintptr_t>(&ngg::carbon::HookSetTexture) - base));
+            asi_log::Log("CustomTextureLoader: StartIOCPLoading=%p (offset=0x%X)",
+                         reinterpret_cast<void*>(&ngg::carbon::StartIOCPLoading),
+                         static_cast<unsigned>(reinterpret_cast<uintptr_t>(&ngg::carbon::StartIOCPLoading) - base));
+            asi_log::Log("CustomTextureLoader: IOCPWorkerThread=%p (offset=0x%X)",
+                         reinterpret_cast<void*>(&ngg::carbon::IOCPWorkerThread),
+                         static_cast<unsigned>(reinterpret_cast<uintptr_t>(&ngg::carbon::IOCPWorkerThread) - base));
+            asi_log::Log("CustomTextureLoader: BuildSwapTable=%p (offset=0x%X)",
+                         reinterpret_cast<void*>(&ngg::carbon::BuildSwapTable),
+                         static_cast<unsigned>(reinterpret_cast<uintptr_t>(&ngg::carbon::BuildSwapTable) - base));
+            asi_log::Log("CustomTextureLoader: SwapTextures=%p (offset=0x%X)",
+                         reinterpret_cast<void*>(&ngg::carbon::SwapTextures),
+                         static_cast<unsigned>(reinterpret_cast<uintptr_t>(&ngg::carbon::SwapTextures) - base));
+            asi_log::Log("CustomTextureLoader: HookSwap=%p (offset=0x%X)",
+                         reinterpret_cast<void*>(&ngg::carbon::HookSwap),
+                         static_cast<unsigned>(reinterpret_cast<uintptr_t>(&ngg::carbon::HookSwap) - base));
+        }
+    }
 
     // Initialize critical sections (never deleted - OS cleans up on process exit)
     if (!ngg::carbon::g_mutexesInitialized)

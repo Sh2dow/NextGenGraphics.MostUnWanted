@@ -30,6 +30,128 @@ static std::atomic g_setTextureHooked{false};
 
 bool triedInit = false;
 
+HRESULT STDMETHODCALLTYPE HookedSetTexture(IDirect3DDevice9* device, DWORD stage, IDirect3DBaseTexture9* texture);
+HRESULT APIENTRY HookedPresent(IDirect3DDevice9* device, CONST RECT* src, CONST RECT* dest, HWND wnd, CONST RGNDATA* dirty);
+
+// Crash logging (addresses only, no symbolization)
+static void* g_exceptionHandler = nullptr;
+
+static LONG WINAPI VectoredExceptionLogger(_EXCEPTION_POINTERS* info)
+{
+    static std::atomic<bool> inHandler{false};
+    if (inHandler.exchange(true))
+        return EXCEPTION_CONTINUE_SEARCH;
+
+    if (!info || !info->ExceptionRecord)
+    {
+        inHandler.store(false);
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+
+    if (info->ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION)
+    {
+        void* frames[32] = {};
+        USHORT count = CaptureStackBackTrace(0, 32, frames, nullptr);
+
+        char header[256] = {};
+        _snprintf_s(header, sizeof(header), _TRUNCATE,
+                    "Crash: AV at %p, access type=%lu, address=%p, stack frames=%u\n",
+                    info->ExceptionRecord->ExceptionAddress,
+                    info->ExceptionRecord->ExceptionInformation[0],
+                    reinterpret_cast<void*>(info->ExceptionRecord->ExceptionInformation[1]),
+                    count);
+        OutputDebugStringA(header);
+
+        for (USHORT i = 0; i < count; ++i)
+        {
+            HMODULE module = nullptr;
+            char modulePath[MAX_PATH] = {};
+            uintptr_t offset = 0;
+
+            if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+                                   reinterpret_cast<LPCSTR>(frames[i]),
+                                   &module))
+            {
+                GetModuleFileNameA(module, modulePath, MAX_PATH);
+                offset = reinterpret_cast<uintptr_t>(frames[i]) - reinterpret_cast<uintptr_t>(module);
+            }
+
+            char line[512] = {};
+            if (modulePath[0])
+            {
+                _snprintf_s(line, sizeof(line), _TRUNCATE, "  #%02u %p (%s + 0x%X)\n",
+                            i, frames[i], modulePath, static_cast<unsigned>(offset));
+            }
+            else
+            {
+                _snprintf_s(line, sizeof(line), _TRUNCATE, "  #%02u %p\n", i, frames[i]);
+            }
+            OutputDebugStringA(line);
+        }
+    }
+
+    inHandler.store(false);
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+static void InstallDeviceHooks(IDirect3DDevice9* device)
+{
+    if (!device)
+        return;
+
+    void** deviceVTable = *reinterpret_cast<void***>(device);
+    if (!deviceVTable)
+        return;
+
+    // Hook Present (index 17) using MinHook - hook based on the actual game device
+    if (!g_vtableHooked.load())
+    {
+        void* presentTarget = deviceVTable[17];
+        MH_STATUS status = MH_CreateHook(presentTarget, &HookedPresent, reinterpret_cast<LPVOID*>(&g_originalPresent));
+        if (status == MH_OK)
+        {
+            status = MH_EnableHook(presentTarget);
+            if (status == MH_OK)
+            {
+                g_vtableHooked.store(true);
+                asi_log::Log("HookPresent: IDirect3DDevice9::Present hooked successfully via MinHook\n");
+                asi_log::Log("HookPresent: g_originalPresent = %p\n", g_originalPresent);
+            }
+            else
+            {
+                asi_log::Log("HookPresent: Failed to enable Present hook: %s\n", MH_StatusToString(status));
+            }
+        }
+        else
+        {
+            asi_log::Log("HookPresent: Failed to create Present hook: %s\n", MH_StatusToString(status));
+        }
+    }
+
+    // Hook SetTexture (index 65) if needed
+    if (!g_setTextureHooked.load())
+    {
+        void* setTextureTarget = deviceVTable[65];
+        MH_STATUS status = MH_CreateHook(setTextureTarget, &HookedSetTexture, reinterpret_cast<LPVOID*>(&g_originalSetTexture));
+        if (status == MH_OK)
+        {
+            status = MH_EnableHook(setTextureTarget);
+            if (status == MH_OK)
+            {
+                g_setTextureHooked.store(true);
+                asi_log::Log("HookPresent: IDirect3DDevice9::SetTexture hooked successfully via MinHook\n");
+            }
+            else
+            {
+                asi_log::Log("HookPresent: Failed to enable SetTexture hook: %s\n", MH_StatusToString(status));
+            }
+        }
+        else
+        {
+            asi_log::Log("HookPresent: Failed to create SetTexture hook: %s\n", MH_StatusToString(status));
+        }
+    }
+}
 
 static void Initialize()
 {
@@ -94,8 +216,9 @@ HRESULT APIENTRY HookedCreateDevice(
             result = createDeviceFn(d3d, adapter, deviceType, focusWindow, newBehaviorFlags, presentParams, device);
     }
 
-    // Device created successfully - CustomTextureLoader will start IOCP loading on first Present call
-    // (no need to call SetD3DDevice here)
+    // Device created successfully - install hooks on the actual game device
+    if (SUCCEEDED(result) && device && *device)
+        InstallDeviceHooks(*device);
 
     return result;
 }
@@ -197,58 +320,6 @@ void HookPresent()
         }
     }
 
-    // Now create dummy device to get IDirect3DDevice9 vtable
-    D3DPRESENT_PARAMETERS pp = {};
-    pp.Windowed = TRUE;
-    pp.SwapEffect = D3DSWAPEFFECT_DISCARD;
-    pp.hDeviceWindow = GetForegroundWindow();
-
-    IDirect3DDevice9* dummyDevice = nullptr;
-    if (FAILED(d3d->CreateDevice(D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, pp.hDeviceWindow,
-        D3DCREATE_SOFTWARE_VERTEXPROCESSING, &pp, &dummyDevice)))
-    {
-        d3d->Release();
-        return;
-    }
-
-    // Get vtable from dummyDevice
-    void** deviceVTable = *reinterpret_cast<void***>(dummyDevice);
-    if (!deviceVTable)
-    {
-        dummyDevice->Release();
-        d3d->Release();
-        return;
-    }
-
-    // Hook Present (index 17) using MinHook - this will follow any existing hook chains
-    void* presentTarget = deviceVTable[17];
-
-    asi_log::Log("HookPresent: deviceVTable = %p, deviceVTable[17] = %p\n", deviceVTable, presentTarget);
-
-    MH_STATUS status = MH_CreateHook(presentTarget, &HookedPresent, reinterpret_cast<LPVOID*>(&g_originalPresent));
-    if (status == MH_OK)
-    {
-        status = MH_EnableHook(presentTarget);
-        if (status == MH_OK)
-        {
-            g_vtableHooked.store(true);
-            asi_log::Log("HookPresent: IDirect3DDevice9::Present hooked successfully via MinHook\n");
-            asi_log::Log("HookPresent: g_originalPresent = %p\n", g_originalPresent);
-        }
-        else
-        {
-            asi_log::Log("HookPresent: Failed to enable Present hook: %s\n", MH_StatusToString(status));
-        }
-    }
-    else
-    {
-        asi_log::Log("HookPresent: Failed to create Present hook: %s\n", MH_StatusToString(status));
-    }
-
-    // NOTE: SetTexture hook is installed dynamically in HookedPresent() when we get the real game device
-
-    // Clean up dummy objects
-    dummyDevice->Release();
     d3d->Release();
 }
 
@@ -284,6 +355,44 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
     if (reason == DLL_PROCESS_ATTACH)
     {
         DisableThreadLibraryCalls(hModule);
+
+        if (!g_exceptionHandler)
+            g_exceptionHandler = AddVectoredExceptionHandler(1, VectoredExceptionLogger);
+
+        {
+            HMODULE module = nullptr;
+            if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+                                   reinterpret_cast<LPCSTR>(&HookedPresent),
+                                   &module))
+            {
+                auto base = reinterpret_cast<uintptr_t>(module);
+                asi_log::Log("DllMain: Module base=%p", module);
+                asi_log::Log("DllMain: HookedPresent=%p (offset=0x%X)",
+                             reinterpret_cast<void*>(&HookedPresent),
+                             static_cast<unsigned>(reinterpret_cast<uintptr_t>(&HookedPresent) - base));
+                asi_log::Log("DllMain: HookedSetTexture=%p (offset=0x%X)",
+                             reinterpret_cast<void*>(&HookedSetTexture),
+                             static_cast<unsigned>(reinterpret_cast<uintptr_t>(&HookedSetTexture) - base));
+                asi_log::Log("DllMain: HookedCreateDevice=%p (offset=0x%X)",
+                             reinterpret_cast<void*>(&HookedCreateDevice),
+                             static_cast<unsigned>(reinterpret_cast<uintptr_t>(&HookedCreateDevice) - base));
+                asi_log::Log("DllMain: HookPresent=%p (offset=0x%X)",
+                             reinterpret_cast<void*>(&HookPresent),
+                             static_cast<unsigned>(reinterpret_cast<uintptr_t>(&HookPresent) - base));
+                asi_log::Log("DllMain: InstallDeviceHooks=%p (offset=0x%X)",
+                             reinterpret_cast<void*>(&InstallDeviceHooks),
+                             static_cast<unsigned>(reinterpret_cast<uintptr_t>(&InstallDeviceHooks) - base));
+                asi_log::Log("DllMain: VectoredExceptionLogger=%p (offset=0x%X)",
+                             reinterpret_cast<void*>(&VectoredExceptionLogger),
+                             static_cast<unsigned>(reinterpret_cast<uintptr_t>(&VectoredExceptionLogger) - base));
+                asi_log::Log("DllMain: Initialize=%p (offset=0x%X)",
+                             reinterpret_cast<void*>(&Initialize),
+                             static_cast<unsigned>(reinterpret_cast<uintptr_t>(&Initialize) - base));
+                asi_log::Log("DllMain: UnhookPresent=%p (offset=0x%X)",
+                             reinterpret_cast<void*>(&UnhookPresent),
+                             static_cast<unsigned>(reinterpret_cast<uintptr_t>(&UnhookPresent) - base));
+            }
+        }
 
         // Initialize MinHook FIRST (before any hooks are installed)
         MH_STATUS status = MH_Initialize();
@@ -322,6 +431,12 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
         // Uninitialize MinHook LAST (after all hooks are removed)
         MH_Uninitialize();
         asi_log::Log("DllMain: MinHook uninitialized\n");
+
+        if (g_exceptionHandler)
+        {
+            RemoveVectoredExceptionHandler(g_exceptionHandler);
+            g_exceptionHandler = nullptr;
+        }
     }
 
     return TRUE;
