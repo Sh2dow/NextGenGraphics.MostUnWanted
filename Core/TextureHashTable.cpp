@@ -2,24 +2,44 @@
 #include "TextureHashTable.h"
 #include "../Log.h"
 #include <cstring>
+#if GAME_MW
+#include "../NFSMW_PreFEngHook.h"
+#elif GAME_CARBON
+#include "../NFSC_PreFEngHook.h"
+#endif
 
+#ifndef USE_FASTMEM
+#define USE_FASTMEM 0
+#endif
 namespace ngg {
 namespace mw {
 
 // ============================================================================
-// FastMem integration
+// FastMem integration (game-specific)
 // ============================================================================
 
-#define FASTMEM_INSTANCE 0x925B30
-typedef void* (__thiscall* FastMem_Alloc_t)(DWORD*, size_t, const char*);
-static FastMem_Alloc_t FastMem_Alloc = (FastMem_Alloc_t)0x5D29D0;
-
-// Helper: Allocate from game's FastMem
-static void* AllocFromFastMem(size_t size, const char* kind)
-{
-    DWORD* fastMemInstance = reinterpret_cast<DWORD*>(FASTMEM_INSTANCE);
-    return FastMem_Alloc(fastMemInstance, size, kind);
-}
+// Carbon: use game heap (no FastMem)
+#if GAME_CARBON
+    static void* AllocFromFastMem(size_t size, const char* /*kind*/)
+    {
+        // Use the process heap for Carbon to avoid FastMem AVs.
+        // If desired, we can later switch to game's heap API explicitly.
+        return HeapAlloc(GetProcessHeap(), 0, size);
+    }
+#elif USE_FASTMEM
+    // MW: Use game's FastMem for all allocations
+    static void* AllocFromFastMem(size_t size, const char* kind)
+    {
+        DWORD* fastMemInstance = reinterpret_cast<DWORD*>(FASTMEM_INSTANCE);
+        return FastMem_Alloc(fastMemInstance, size, kind);
+    }
+#else
+    // Default fallback: process heap
+    static void* AllocFromFastMem(size_t size, const char* /*kind*/)
+    {
+        return HeapAlloc(GetProcessHeap(), 0, size);
+    }
+#endif
 
 // ============================================================================
 // TextureHashTable implementation
@@ -351,6 +371,6 @@ IDirect3DVolumeTexture9* TextureHashTable::GetVolumeTexture(uint32_t hash)
     return nullptr;
 }
 
-} // namespace mw
+} // namespace speed
 } // namespace ngg
 

@@ -2,7 +2,10 @@
 #include "CustomTextureLoader.h"
 #include "TPFLoader.h"
 
+#define NGG_ENABLE_GAMETEXTUREHASHES 0
+#if NGG_ENABLE_GAMETEXTUREHASHES
 #include "HashMaps/MW_GameTextureHashes.h"  // Auto-generated hash validation (MW TRACKS)
+#endif
 
 // Core components (Phase 1 refactoring)
 #include "Core/TextureHashTable.h"
@@ -220,9 +223,18 @@ namespace
     // Build the swap table by validating all custom textures against game's texture list
     // This is called once after all textures are loaded
     // Provides fast O(1) lookup and filters out invalid hashes
+#if NGG_ENABLE_GAMETEXTUREHASHES
 #include "TextureSwapTable.h"
 // Legacy BuildSwapTable moved to TextureSwapTable.h
 static void RebuildSwapTableBridge(bool force) { BuildSwapTableEx(force, &g_swapTableLock); }
+#else
+// When MW_GameTextureHashes are disabled, rely on dynamic CRC32/TPF mappings only.
+// Keep swap table unbuilt so SwapTextures uses the fallback path.
+static void RebuildSwapTableBridge(bool force)
+{
+    (void)force;
+}
+#endif
 
 // Keeping the old implementation disabled for reference
 
@@ -463,8 +475,12 @@ void CustomTextureLoader::enable()
     }
 
     // Log hashmap statistics
+#if NGG_ENABLE_GAMETEXTUREHASHES
     asi_log::Log("CustomTextureLoader: Loaded game texture hashmap - %zu valid texture hashes from STREAML2RA.BUN",
                  ngg::mw::TOTAL_GAME_TEXTURES);
+#else
+    asi_log::Log("CustomTextureLoader: Loaded game texture hashmap (MW_GameTextureHashes disabled; using dynamic CRC32 cache only)");
+#endif
 
     asi_log::Log("CustomTextureLoader: Installing hooks...");
     {
@@ -513,8 +529,10 @@ void CustomTextureLoader::disable()
     Sleep(100);
 
     // Unhook installed hooks AFTER stopping workers
+#ifndef USE_INJECTOR
     ngg::mw::UninstallTextureHooks();
-
+#endif
+    
     // Wait a bit for hooks to finish executing
     Sleep(100);
 

@@ -39,5 +39,13 @@ namespace ngg
 
         // Game context for material API
         constexpr uintptr_t GAME_CONTEXT_PTR = 0x982C80;  // Pointer to game context/state object
+
+        // MW addresses
+#define FASTMEM_INSTANCE 0x925B30
+        typedef void* (__thiscall* FastMem_Alloc_t)(DWORD*, size_t, const char*);
+        static FastMem_Alloc_t FastMem_Alloc = (FastMem_Alloc_t)0x5D29D0;
     }
+    
+    // Temporary alias to keep existing ngg::speed:: references working in Carbon builds
+    namespace speed { using namespace mw; }
 }

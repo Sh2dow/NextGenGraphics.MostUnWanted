@@ -5,6 +5,8 @@
 #include <string>
 #include <cstdint>
 
+#include "../HashMaps/MW_CRC32Cache_Static.h"
+
 namespace ngg {
 namespace mw {
 
@@ -94,7 +96,7 @@ public:
     static constexpr size_t GetTableSize() { return HASH_TABLE_SIZE; }
 
 private:
-    static constexpr size_t HASH_TABLE_SIZE = 1024;
+    static constexpr size_t HASH_TABLE_SIZE = kGameToCrc32PairsCount;
 
     // Hash tables (allocated from FastMem)
     TexturePathEntry** m_pathTable;

@@ -35,6 +35,10 @@ static std::atomic g_createDeviceHooked{ false };
 static void** g_createDeviceVTableEntry = nullptr;
 static void* g_savedCreateDevicePtr = nullptr;
 
+// Original Direct3DCreate9 export pointer (hooked via MinHook)
+typedef IDirect3D9* (WINAPI* Direct3DCreate9Fn)(UINT);
+static Direct3DCreate9Fn g_originalDirect3DCreate9 = nullptr;
+
 bool triedInit = false;
 
 
@@ -66,39 +70,7 @@ void OnPresent()
     }
 }
 
-// Hooked CreateDevice - adds D3DCREATE_MULTITHREADED flag
-HRESULT APIENTRY HookedCreateDevice(
-    IDirect3D9* d3d,
-    UINT adapter,
-    D3DDEVTYPE deviceType,
-    HWND focusWindow,
-    DWORD behaviorFlags,
-    D3DPRESENT_PARAMETERS* presentParams,
-    IDirect3DDevice9** device)
-{
-    // CRITICAL: Add D3DCREATE_MULTITHREADED flag to allow D3DX calls from worker threads!
-    // Without this flag, D3DX calls from worker threads will corrupt internal state
-    // and cause crashes when the game calls D3DX from the main thread.
-    DWORD newBehaviorFlags = behaviorFlags | D3DCREATE_MULTITHREADED;
-
-    asi_log::Log("HookedCreateDevice: Original BehaviorFlags = 0x%08X, New BehaviorFlags = 0x%08X\n",
-                 behaviorFlags, newBehaviorFlags);
-
-    // Call original CreateDevice with modified flags
-    if (g_originalCreateDevice)
-        return g_originalCreateDevice(d3d, adapter, deviceType, focusWindow, newBehaviorFlags, presentParams, device);
-
-    // Fallback: call through vtable
-    typedef HRESULT(APIENTRY* CreateDeviceLocalFn)(IDirect3D9*, UINT, D3DDEVTYPE, HWND, DWORD, D3DPRESENT_PARAMETERS*, IDirect3DDevice9**);
-    void** vtable = *reinterpret_cast<void***>(d3d);
-    CreateDeviceLocalFn createDeviceFn = reinterpret_cast<CreateDeviceLocalFn>(vtable[16]);
-    if (createDeviceFn && createDeviceFn != &HookedCreateDevice)
-        return createDeviceFn(d3d, adapter, deviceType, focusWindow, newBehaviorFlags, presentParams, device);
-
-    return D3DERR_INVALIDCALL;
-}
-
-// Hooked Present (unchanged behaviour)
+// Hooked Present - triggers initialization and forwards to original
 HRESULT APIENTRY HookedPresent(IDirect3DDevice9* device, CONST RECT* src, CONST RECT* dest, HWND wnd, CONST RGNDATA* dirty)
 {
     OnPresent(); // trigger Initialize logic
@@ -118,75 +90,142 @@ HRESULT APIENTRY HookedPresent(IDirect3DDevice9* device, CONST RECT* src, CONST 
     return D3D_OK;
 }
 
-// Patch Present and CreateDevice by replacing vtable entries
-void HookPresent()
+// Hooked CreateDevice - adds D3DCREATE_MULTITHREADED flag and installs Present hook
+HRESULT APIENTRY HookedCreateDevice(
+    IDirect3D9* d3d,
+    UINT adapter,
+    D3DDEVTYPE deviceType,
+    HWND focusWindow,
+    DWORD behaviorFlags,
+    D3DPRESENT_PARAMETERS* presentParams,
+    IDirect3DDevice9** device)
 {
-    // Create dummy D3D9 object to get vtables
-    IDirect3D9* d3d = Direct3DCreate9(D3D_SDK_VERSION);
-    if (!d3d)
-        return;
+    // CRITICAL: Add D3DCREATE_MULTITHREADED flag to allow D3DX calls from worker threads!
+    // Without this flag, D3DX calls from worker threads will corrupt internal state
+    // and cause crashes when the game calls D3DX from the main thread.
+    DWORD newBehaviorFlags = behaviorFlags | D3DCREATE_MULTITHREADED;
 
-    // Hook IDirect3D9::CreateDevice (index 16) to add D3DCREATE_MULTITHREADED flag
-    void** d3dVTable = *reinterpret_cast<void***>(d3d);
-    if (d3dVTable)
+    asi_log::Log("HookedCreateDevice: Original BehaviorFlags = 0x%08X, New BehaviorFlags = 0x%08X\n",
+                 behaviorFlags, newBehaviorFlags);
+
+    HRESULT hr = D3DERR_INVALIDCALL;
+
+    // Call original CreateDevice with modified flags
+    if (g_originalCreateDevice)
     {
-        void* originalCreateDevicePtr = d3dVTable[16];
-        g_originalCreateDevice = reinterpret_cast<CreateDeviceFn>(originalCreateDevicePtr);
-
-        if (MakeVTableHook(d3dVTable, 16, reinterpret_cast<void*>(&HookedCreateDevice), &g_savedCreateDevicePtr))
-        {
-            g_createDeviceHooked.store(true);
-            g_createDeviceVTableEntry = &d3dVTable[16];
-            asi_log::Log("HookPresent: IDirect3D9::CreateDevice hooked successfully\n");
-        }
-        else
-        {
-            asi_log::Log("HookPresent: Failed to hook IDirect3D9::CreateDevice\n");
-        }
-    }
-
-    // Now create dummy device to get IDirect3DDevice9 vtable
-    D3DPRESENT_PARAMETERS pp = {};
-    pp.Windowed = TRUE;
-    pp.SwapEffect = D3DSWAPEFFECT_DISCARD;
-    pp.hDeviceWindow = GetForegroundWindow();
-
-    IDirect3DDevice9* dummyDevice = nullptr;
-    if (FAILED(d3d->CreateDevice(D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, pp.hDeviceWindow,
-        D3DCREATE_SOFTWARE_VERTEXPROCESSING, &pp, &dummyDevice)))
-    {
-        d3d->Release();
-        return;
-    }
-
-    // Get vtable from dummyDevice
-    void** deviceVTable = *reinterpret_cast<void***>(dummyDevice);
-    if (!deviceVTable)
-    {
-        dummyDevice->Release();
-        d3d->Release();
-        return;
-    }
-
-    // Save original Present (index 17)
-    void* originalPtr = deviceVTable[17];
-    g_originalPresent = reinterpret_cast<PresentFn>(originalPtr);
-
-    // Install Present hook
-    if (MakeVTableHook(deviceVTable, 17, reinterpret_cast<void*>(&HookedPresent), &g_savedOriginalPtr))
-    {
-        g_vtableHooked.store(true);
-        g_patchedVTableEntry = &deviceVTable[17];
-        asi_log::Log("HookPresent: IDirect3DDevice9::Present hooked successfully\n");
+        hr = g_originalCreateDevice(d3d, adapter, deviceType, focusWindow, newBehaviorFlags, presentParams, device);
     }
     else
     {
-        asi_log::Log("HookPresent: Failed to hook IDirect3DDevice9::Present\n");
+        // Fallback: call through vtable (should not normally happen)
+        typedef HRESULT(APIENTRY* CreateDeviceLocalFn)(IDirect3D9*, UINT, D3DDEVTYPE, HWND, DWORD, D3DPRESENT_PARAMETERS*, IDirect3DDevice9**);
+        void** vtable = *reinterpret_cast<void***>(d3d);
+        CreateDeviceLocalFn createDeviceFn = reinterpret_cast<CreateDeviceLocalFn>(vtable[16]);
+        if (createDeviceFn && createDeviceFn != &HookedCreateDevice)
+            hr = createDeviceFn(d3d, adapter, deviceType, focusWindow, newBehaviorFlags, presentParams, device);
     }
 
-    // Clean up dummy objects
-    dummyDevice->Release();
-    d3d->Release();
+    if (SUCCEEDED(hr) && device && *device)
+    {
+        // Install Present hook on the first created device
+        if (!g_vtableHooked.load())
+        {
+            void** deviceVTable = *reinterpret_cast<void***>(*device);
+            if (deviceVTable)
+            {
+                void* originalPtr = deviceVTable[17];
+                g_originalPresent = reinterpret_cast<PresentFn>(originalPtr);
+
+                if (MakeVTableHook(deviceVTable, 17, reinterpret_cast<void*>(&HookedPresent), &g_savedOriginalPtr))
+                {
+                    g_vtableHooked.store(true);
+                    g_patchedVTableEntry = &deviceVTable[17];
+                    asi_log::Log("HookedCreateDevice: IDirect3DDevice9::Present hooked successfully\n");
+                }
+                else
+                {
+                    asi_log::Log("HookedCreateDevice: Failed to hook IDirect3DDevice9::Present\n");
+                }
+            }
+        }
+    }
+
+    return hr;
+}
+
+// Hooked Direct3DCreate9  installs CreateDevice hook lazily when D3D9 is created
+IDirect3D9* WINAPI HookedDirect3DCreate9(UINT sdkVersion)
+{
+    if (!g_originalDirect3DCreate9)
+        return nullptr;
+
+    IDirect3D9* d3d = g_originalDirect3DCreate9(sdkVersion);
+    if (!d3d)
+        return nullptr;
+
+    // Install CreateDevice hook once on the first IDirect3D9 we see
+    if (!g_createDeviceHooked.load())
+    {
+        void** vtable = *reinterpret_cast<void***>(d3d);
+        if (vtable)
+        {
+            void* originalCreateDevicePtr = vtable[16];
+            g_originalCreateDevice = reinterpret_cast<CreateDeviceFn>(originalCreateDevicePtr);
+
+            if (MakeVTableHook(vtable, 16, reinterpret_cast<void*>(&HookedCreateDevice), &g_savedCreateDevicePtr))
+            {
+                g_createDeviceHooked.store(true);
+                g_createDeviceVTableEntry = &vtable[16];
+                asi_log::Log("HookedDirect3DCreate9: IDirect3D9::CreateDevice hooked successfully\n");
+            }
+            else
+            {
+                asi_log::Log("HookedDirect3DCreate9: Failed to hook IDirect3D9::CreateDevice\n");
+            }
+        }
+    }
+
+    return d3d;
+}
+
+// Install hook on Direct3DCreate9 using MinHook, ReShade-style
+void HookPresent()
+{
+    asi_log::Log("HookPresent: Initializing MinHook and hooking Direct3DCreate9\n");
+
+    MH_STATUS status = MH_Initialize();
+    if (status != MH_OK && status != MH_ERROR_ALREADY_INITIALIZED)
+    {
+        asi_log::Log("HookPresent: MH_Initialize failed: %d\n", status);
+        return;
+    }
+
+    // Ensure d3d9.dll is loaded in this process
+    HMODULE hD3D9 = LoadLibraryW(L"d3d9.dll");
+    if (!hD3D9)
+    {
+        asi_log::Log("HookPresent: LoadLibraryW(d3d9.dll) failed\n");
+        return;
+    }
+
+    status = MH_CreateHookApi(L"d3d9.dll", "Direct3DCreate9",
+        reinterpret_cast<LPVOID>(&HookedDirect3DCreate9),
+        reinterpret_cast<LPVOID*>(&g_originalDirect3DCreate9));
+
+    if (status != MH_OK && status != MH_ERROR_ALREADY_CREATED)
+    {
+        asi_log::Log("HookPresent: MH_CreateHookApi failed: %d\n", status);
+        return;
+    }
+
+    status = MH_EnableHook(MH_ALL_HOOKS);
+    if (status != MH_OK && status != MH_ERROR_ENABLED)
+    {
+        asi_log::Log("HookPresent: MH_EnableHook failed: %d\n", status);
+        return;
+    }
+
+    asi_log::Log("HookPresent: Direct3DCreate9 hook installed\n");
 }
 
 // Restore hooks (call on DLL unload)
@@ -235,21 +274,15 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
     {
         DisableThreadLibraryCalls(hModule);
 
-        // Initialize MinHook
-        MH_STATUS status = MH_Initialize();
-        if (status != MH_OK)
-        {
-            asi_log::Log("DllMain: Failed to initialize MinHook: %s\n", MH_StatusToString(status));
-            return FALSE;
-        }
-        asi_log::Log("DllMain: MinHook initialized successfully\n");
-
         CreateThread(nullptr, 0, [](LPVOID) -> DWORD
         {
             // Wait for game to initialize before hooking Present
             // This prevents crashes with other mods that expect game state to be ready
-            Sleep(1000); // 1 second delay to let game initialize
-            HookPresent(); // install vtable patching on a background thread
+            // BUT: either doesn't work or crash for teleport hook
+            // Sleep(100);
+            
+            // Install D3D9 hook on a background thread (avoids heavy work in DllMain)
+            HookPresent();
             return 0;
         }, nullptr, 0, nullptr);
     }
@@ -274,9 +307,6 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
 
         // Unhook Present (this is safe because we control the vtable)
         UnhookPresent();
-
-        // Uninitialize MinHook
-        MH_Uninitialize();
     }
 
     return TRUE;

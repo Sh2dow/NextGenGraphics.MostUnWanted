@@ -95,7 +95,7 @@
         <ClCompile>
             <LanguageStandard>stdcpp17</LanguageStandard>
             <AdditionalIncludeDirectories>
-                includes;includes\json\include;includes\spdlog\include;includes\miniz;
+                includes;includes\json\include;includes\spdlog\include;includes\miniz;includes\injector;
                 $(DXSDK_DIR)Include;%(AdditionalIncludeDirectories)
             </AdditionalIncludeDirectories>
         </ClCompile>
@@ -123,7 +123,7 @@
             <PrecompiledHeader>NotUsing</PrecompiledHeader>
             <WarningLevel>Level4</WarningLevel>
             <Optimization>MaxSpeed</Optimization>
-            <PreprocessorDefinitions>GAME_MW;WIN32;_RELEASE;_WINDOWS;_USRDLL;_CRT_SECURE_NO_WARNINGS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+            <PreprocessorDefinitions>GAME_MW;WIN32;NDEBUG;_WINDOWS;_USRDLL;_CRT_SECURE_NO_WARNINGS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
             <FunctionLevelLinking>true</FunctionLevelLinking>
             <IntrinsicFunctions>true</IntrinsicFunctions>
             <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
@@ -152,7 +152,7 @@
             <PrecompiledHeader>NotUsing</PrecompiledHeader>
             <WarningLevel>Level4</WarningLevel>
             <Optimization>MaxSpeed</Optimization>
-            <PreprocessorDefinitions>GAME_CARBON;WIN32;_RELEASE;_WINDOWS;_USRDLL;_CRT_SECURE_NO_WARNINGS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+            <PreprocessorDefinitions>GAME_CARBON;WIN32;NDEBUG;_WINDOWS;_USRDLL;_CRT_SECURE_NO_WARNINGS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
             <FunctionLevelLinking>true</FunctionLevelLinking>
             <IntrinsicFunctions>true</IntrinsicFunctions>
             <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
@@ -218,7 +218,7 @@
     <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug_MW|Win32' Or '$(Configuration)|$(Platform)'=='Release_MW|Win32'">
         <PostBuildEvent>
             <Command>
-                XCOPY /Y /R "$(TargetDir)*" "d:\Games\NFS MW - Vanilla\SCRIPTS\"
+                XCOPY /Y /R "$(TargetDir)*" "d:\Games\NFS MW - X360\SCRIPTS\"
             </Command>
         </PostBuildEvent>
     </ItemDefinitionGroup>

@@ -104,7 +104,7 @@ void SwapTextures(const SwapContext& ctx)
     if (ctx.swapCallCount && ctx.swapSuccessCount)
     {
         uint32_t calls = *ctx.swapCallCount;
-        if (calls <= 10 || (calls % 1000) == 0)
+        if (calls <= 10 || (calls % 100000) == 0)
         {
             asi_log::Log("CustomTextureLoader: SwapTextures called %u times (%u successful swaps, %d textures loaded)",
                          calls,

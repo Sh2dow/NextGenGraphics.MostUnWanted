@@ -1,7 +1,7 @@
 #include "CustomTextureHooks.h"
 
 #include <windows.h>
-#include "includes/minhook/include/MinHook.h"
+
 #include "Log.h"
 
 #ifdef GAME_MW
@@ -14,9 +14,38 @@ namespace ngg {
         namespace carbon {
 #endif
 
+#if USE_INJECTOR
+#include "includes/injector/injector.hpp"
+#else
+#include "includes/minhook/include/MinHook.h"
+#endif
+            
 static bool g_hookLoadInstalled_state = false;
 static bool g_hookSwapInstalled_state = false;
 
+#if USE_INJECTOR
+bool InstallTextureHooks(void* pHookLoad, void* pHookSwap)
+{
+    asi_log::Log("CustomTextureHooks: Installing injector hooks...");
+
+    // Install Hook 1: Load all textures (called when graphics settings change)
+    injector::MakeJMP(HOOK_LOAD_ADDR, pHookLoad, true);
+    g_hookLoadInstalled_state = true;
+
+    // Install Hook 2: Texture swapping (just swaps, no loading)
+    injector::MakeJMP(HOOK_SWAP_ADDR, pHookSwap, true);
+    g_hookSwapInstalled_state = true;
+
+    asi_log::Log("CustomTextureLoader: Hooks installed");
+
+    // IOCP loading will start when SetD3DDevice is called for the first time
+    asi_log::Log("CustomTextureLoader: Waiting for D3D device to start IOCP loading...");
+
+    const bool ok = g_hookLoadInstalled_state && g_hookSwapInstalled_state;
+    asi_log::Log(ok ? "CustomTextureHooks: Hooks installed" : "CustomTextureHooks: One or more hooks failed");
+    return ok;
+}
+#else
 static const char* MH_StatusToStringLocal(MH_STATUS s)
 {
     switch (s) {
@@ -36,7 +65,6 @@ static const char* MH_StatusToStringLocal(MH_STATUS s)
     default: return "UNKNOWN";
     }
 }
-
 bool InstallTextureHooks(void* pHookLoad, void* pHookSwap)
 {
     asi_log::Log("CustomTextureHooks: Installing hooks...");
@@ -63,6 +91,7 @@ bool InstallTextureHooks(void* pHookLoad, void* pHookSwap)
     asi_log::Log(ok ? "CustomTextureHooks: Hooks installed" : "CustomTextureHooks: One or more hooks failed");
     return ok;
 }
+            
 
 void UninstallTextureHooks()
 {
@@ -88,6 +117,7 @@ void UninstallTextureHooks()
         MH_RemoveHook(reinterpret_cast<void*>(HOOK_SWAP_ADDR));
     }
 }
+#endif
 
 } // namespace mw
 } // namespace ngg
