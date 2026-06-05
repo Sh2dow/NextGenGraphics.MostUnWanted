@@ -273,11 +273,18 @@ static void RebuildSwapTableBridge(bool force)
         g_pathsLoaded = false; // Force re-parse
         ParseTexturePaths();
 
-        // NOTE: We do NOT start IOCP loading here!
-        // IOCP loading is started from SetD3DDevice() where we have a valid device pointer.
-        // Hook 1 is called when graphics settings change, which might happen before device creation.
-
         asi_log::Log("CustomTextureLoader: Texture paths re-parsed - %d textures found", g_hashTable->CountTexturePaths());
+
+        // Restart IOCP loading if we have a valid device.
+        // In the old D3D9-wrapper design, SetD3DDevice was called every frame
+        // via the Present hook and would detect the path-count change here.
+        // Without a Present hook, we restart explicitly.
+        if (g_d3dDevice && g_iocp && g_workerThreads)
+        {
+            ngg::mw::async::StartIOCPLoading(g_asyncCtx, g_d3dDevice, g_hashTable, g_crc32Manager);
+            asi_log::Log("CustomTextureLoader: IOCP loading restarted for %d textures after re-parse",
+                         g_hashTable->CountTexturePaths());
+        }
     }
 
     // Hook 1: Parse texture paths (called when graphics settings change)
@@ -332,9 +339,7 @@ void CustomTextureLoader::SetShuttingDown()
     g_isShuttingDown = true;
 }
 
-// Set D3D device (called from dllmain.cpp on every frame)
-// NOTE: With IOCP approach, we don't store the device globally!
-// Instead, we pass it WITH EACH TEXTURE LOADING REQUEST.
+// Set D3D device (called once from InitThread after device is found)
 void CustomTextureLoader::SetD3DDevice(IDirect3DDevice9* device)
 {
     GetOptimalWorkerThreadCount();
@@ -413,19 +418,11 @@ void CustomTextureLoader::SetD3DDevice(IDirect3DDevice9* device)
         tpfFilesLoaded = true;
     }
 
-    // Track if we need to (re)start IOCP loading for regular textures
-    static size_t lastTextureCount = 0;
-    size_t currentTextureCount = g_hashTable->CountTexturePaths();
-
-    // Start IOCP loading if:
-    // 1. First time device is set, OR
-    // 2. Texture paths changed (Hook 1 was called and re-parsed paths)
-    if (lastTextureCount != currentTextureCount)
-    {
-        asi_log::Log("CustomTextureLoader: Starting IOCP loading (%d textures)...", currentTextureCount);
-        ngg::mw::async::StartIOCPLoading(g_asyncCtx, device, g_hashTable, g_crc32Manager);
-        lastTextureCount = currentTextureCount;
-    }
+    // Start IOCP loading for regular textures (first and only time)
+    // NOTE: Re-loads after path re-parsing are handled by HandleHookLoad
+    // which calls StartIOCPLoading directly.
+    asi_log::Log("CustomTextureLoader: Starting IOCP loading (%d textures)...", g_hashTable->CountTexturePaths());
+    ngg::mw::async::StartIOCPLoading(g_asyncCtx, device, g_hashTable, g_crc32Manager);
 }
 
 // Enable feature (install hooks)

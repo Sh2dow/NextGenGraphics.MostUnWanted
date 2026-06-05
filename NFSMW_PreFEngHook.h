@@ -4,8 +4,6 @@ namespace ngg
 {
     namespace mw
     {
-        constexpr uintptr_t FEMANAGER_INSTANCE_ADDR = 0x0091CAE0;
-        // constexpr uintptr_t USERPROFILE_PTR = (*(int*)(*(int*)((*(int*)FEMANAGER_INSTANCE_ADDR) + 0xD4))); // NFSC style
         constexpr uintptr_t PROFILEMANAGER_INSTANCE_ADDR = 0x00925E5C;
         constexpr uintptr_t USERPROFILE_OFFSET = 0x0C; // needs confirmation via IDA
         constexpr uintptr_t MAINPROFILEMANAGER_VTBL = 0x0089C21C;
@@ -31,6 +29,10 @@ namespace ngg
         // Game addresses
         constexpr uintptr_t HOOK_LOAD_ADDR = 0x6C3A30;      // nullsub_33
         constexpr uintptr_t HOOK_SWAP_ADDR = 0x6C6C8D;      // BEFORE epilogue of sub_6C68B0 (original ASI hooks here!)
+
+        // D3D device pointer stored in speed.exe's global data
+        // IDirect3DDevice9* is stored at this address (NFSMW v1.3)
+        constexpr uintptr_t D3DDEVICE_PTR = 0x00982BDC;
 
         // Game texture wrapper addresses
         constexpr uintptr_t GAME_TEX_WRAPPER_1 = 0x982CB4;  // Pointer to diffuse texture wrapper
