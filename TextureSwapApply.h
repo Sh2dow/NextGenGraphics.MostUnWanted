@@ -16,7 +16,7 @@ namespace ngg {
 
 // Sets a material texture parameter via the game's material API.
 // - material: material object pointer from the game
-// - paramName: parameter name (e.g., "DiffuseMap", "NormalMapTexture", "SPECULARMAPTEXTURE")
+// - paramName: parameter name (e.g., "DiffuseMap", "NormalMap", "SPECULARMAPTEXTURE")
 // - texture: the texture to set (must be non-null)
 // - texPtrStorage: pointer to persistent storage where the game expects to read the texture pointer from
 // - addRefTexture: whether to AddRef() the texture (true for our custom textures; false for the game's originals)

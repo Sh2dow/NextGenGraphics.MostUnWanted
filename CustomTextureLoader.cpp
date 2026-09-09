@@ -99,6 +99,9 @@ namespace
     uint32_t g_swapCallCount = 0;
     uint32_t g_swapSuccessCount = 0;
 
+    // Guard against duplicate StartIOCPLoading calls (prevents texture loading stutters)
+    static uint32_t s_lastIOCPLoadCount = 0;
+
     // ============================================================================
     // SWAP TABLE OPTIMIZATION
     // ============================================================================
@@ -421,8 +424,19 @@ void CustomTextureLoader::SetD3DDevice(IDirect3DDevice9* device)
     // Start IOCP loading for regular textures (first and only time)
     // NOTE: Re-loads after path re-parsing are handled by HandleHookLoad
     // which calls StartIOCPLoading directly.
-    asi_log::Log("CustomTextureLoader: Starting IOCP loading (%d textures)...", g_hashTable->CountTexturePaths());
-    ngg::mw::async::StartIOCPLoading(g_asyncCtx, device, g_hashTable, g_crc32Manager);
+    // Use texture path count guard to avoid duplicate StartIOCPLoading calls
+    // (removed in commit 158a38f caused texture loading stutters)
+    uint32_t currentCount = g_hashTable->CountTexturePaths();
+    if (currentCount != s_lastIOCPLoadCount || s_lastIOCPLoadCount == 0)
+    {
+        asi_log::Log("CustomTextureLoader: Starting IOCP loading (%d textures)...", currentCount);
+        ngg::mw::async::StartIOCPLoading(g_asyncCtx, device, g_hashTable, g_crc32Manager);
+        s_lastIOCPLoadCount = currentCount;
+    }
+    else
+    {
+        asi_log::Log("CustomTextureLoader: IOCP loading already active for %d textures, skipping", currentCount);
+    }
 }
 
 // Enable feature (install hooks)
