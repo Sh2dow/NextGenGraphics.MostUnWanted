@@ -333,7 +333,7 @@ void SwapTextures(const SwapContext& ctx)
     static IDirect3DTexture9** s_texPtr3 = new IDirect3DTexture9*(nullptr);
 
     static const char* diffuseMapStr  = "DiffuseMap";
-    static const char* normalMapStr   = "NormalMap";
+    static const char* normalMapStr   = "NormalMapTexture";
     static const char* specularMapStr = "SPECULARMAPTEXTURE";
 
     // Only set when we actually have a custom texture; avoid redundant re-binding of original textures
