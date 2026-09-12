@@ -185,11 +185,10 @@ namespace
         ngg::mw::TPFLoader loader;
 
         int entriesPosted = loader.LoadTPFAndPostToIOCP(tpfPath,
-            [device](uint32_t hash, const std::string& filename, const uint8_t* ddsData, size_t ddsSize)
+            [](uint32_t hash, const std::string& filename, std::vector<uint8_t>&& ddsData)
             {
-                // Post to IOCP queue for parallel processing via async module
-                std::vector<uint8_t> data(ddsData, ddsData + ddsSize);
-                ngg::mw::async::PostTPFRequest(g_asyncCtx, hash, filename, std::move(data));
+                // Post to IOCP queue for parallel processing via async module (buffer moved - no copy)
+                ngg::mw::async::PostTPFRequest(g_asyncCtx, hash, filename, std::move(ddsData));
             });
 
         if (entriesPosted == 0)

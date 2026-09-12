@@ -22,8 +22,8 @@ class TPFLoader
 {
 public:
     // Callback function type for processing each extracted DDS entry
-    // Parameters: hash, filename, dds_data, dds_size
-    using DDSEntryCallback = std::function<void(uint32_t, const std::string&, const uint8_t*, size_t)>;
+    // Parameters: hash, filename, dds_data (moved - no extra copy)
+    using DDSEntryCallback = std::function<void(uint32_t, const std::string&, std::vector<uint8_t>&&)>;
 
     TPFLoader();
     ~TPFLoader();

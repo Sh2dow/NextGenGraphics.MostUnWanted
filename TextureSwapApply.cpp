@@ -96,9 +96,39 @@ bool SetMaterialTexture(void* material,
 }
 
 
+// Negative-lookup cache (render thread only): hashes that resolved to no custom
+// texture. Cleared whenever the async loader reports newly loaded textures.
+std::unordered_set<uint32_t>& UnresolvedHashes()
+{
+    static std::unordered_set<uint32_t>* s = new std::unordered_set<uint32_t>();
+    return *s;
+}
+
+// Resolve a game hash to a custom texture via the cached CRC32 mapping.
+IDirect3DTexture9* ResolveViaCRC32(const SwapContext& ctx, uint32_t hash)
+{
+    if (!ctx.crc32Manager || !ctx.hashTable)
+        return nullptr;
+    uint32_t cachedCRC32 = ctx.crc32Manager->GetCRC32ByGameHash(hash);
+    if (cachedCRC32 == 0)
+        return nullptr;
+    return ctx.hashTable->GetTexture(cachedCRC32);
+}
+
 void SwapTextures(const SwapContext& ctx)
 {
     if (ctx.swapCallCount) (*ctx.swapCallCount)++;
+
+    // Invalidate the negative-lookup cache when new textures have been loaded
+    {
+        static int s_lastTexturesLoaded = -1;
+        int loadedNow = ctx.texturesLoaded ? ctx.texturesLoaded->load() : 0;
+        if (loadedNow != s_lastTexturesLoaded)
+        {
+            UnresolvedHashes().clear();
+            s_lastTexturesLoaded = loadedNow;
+        }
+    }
 
 #ifdef _DEBUG
     if (ctx.swapCallCount && ctx.swapSuccessCount)
@@ -176,19 +206,19 @@ void SwapTextures(const SwapContext& ctx)
                     // Try by GameHash in main table
                     customTex1 = ctx.hashTable ? ctx.hashTable->GetTexture(hash1) : nullptr;
 
-                    // Try cached CRC32 mapping → GH
-                    if (!customTex1 && ctx.crc32Manager)
+                    // Try cached CRC32 mapping → GH (skipped for known misses)
+                    if (!customTex1 && !UnresolvedHashes().count(hash1))
                     {
-                        uint32_t cachedCRC32 = ctx.crc32Manager->GetCRC32ByGameHash(hash1);
-                        if (cachedCRC32 != 0 && ctx.hashTable)
+                        IDirect3DTexture9* t = ResolveViaCRC32(ctx, hash1);
+                        if (t)
                         {
-                            IDirect3DTexture9* t = ctx.hashTable->GetTexture(cachedCRC32);
-                            if (t)
-                            {
-                                customTex1 = t;
-                                t->AddRef();
-                                (*swapTable)[hash1] = t;
-                            }
+                            customTex1 = t;
+                            t->AddRef();
+                            (*swapTable)[hash1] = t;
+                        }
+                        else
+                        {
+                            UnresolvedHashes().insert(hash1);
                         }
                     }
 
@@ -237,18 +267,18 @@ void SwapTextures(const SwapContext& ctx)
                 else
                 {
                     customTex2 = ctx.hashTable ? ctx.hashTable->GetTexture(hash2) : nullptr;
-                    if (!customTex2 && ctx.crc32Manager)
+                    if (!customTex2 && !UnresolvedHashes().count(hash2))
                     {
-                        uint32_t cachedCRC32 = ctx.crc32Manager->GetCRC32ByGameHash(hash2);
-                        if (cachedCRC32 != 0 && ctx.hashTable)
+                        IDirect3DTexture9* t = ResolveViaCRC32(ctx, hash2);
+                        if (t)
                         {
-                            IDirect3DTexture9* t = ctx.hashTable->GetTexture(cachedCRC32);
-                            if (t)
-                            {
-                                customTex2 = t;
-                                t->AddRef();
-                                (*swapTable)[hash2] = t;
-                            }
+                            customTex2 = t;
+                            t->AddRef();
+                            (*swapTable)[hash2] = t;
+                        }
+                        else
+                        {
+                            UnresolvedHashes().insert(hash2);
                         }
                     }
                 }
@@ -265,18 +295,18 @@ void SwapTextures(const SwapContext& ctx)
                 else
                 {
                     customTex3 = ctx.hashTable ? ctx.hashTable->GetTexture(hash3) : nullptr;
-                    if (!customTex3 && ctx.crc32Manager)
+                    if (!customTex3 && !UnresolvedHashes().count(hash3))
                     {
-                        uint32_t cachedCRC32 = ctx.crc32Manager->GetCRC32ByGameHash(hash3);
-                        if (cachedCRC32 != 0 && ctx.hashTable)
+                        IDirect3DTexture9* t = ResolveViaCRC32(ctx, hash3);
+                        if (t)
                         {
-                            IDirect3DTexture9* t = ctx.hashTable->GetTexture(cachedCRC32);
-                            if (t)
-                            {
-                                customTex3 = t;
-                                t->AddRef();
-                                (*swapTable)[hash3] = t;
-                            }
+                            customTex3 = t;
+                            t->AddRef();
+                            (*swapTable)[hash3] = t;
+                        }
+                        else
+                        {
+                            UnresolvedHashes().insert(hash3);
                         }
                     }
                 }
@@ -291,26 +321,24 @@ void SwapTextures(const SwapContext& ctx)
         customTex2 = ctx.hashTable ? ctx.hashTable->GetTexture(hash2) : nullptr;
         customTex3 = ctx.hashTable ? ctx.hashTable->GetTexture(hash3) : nullptr;
 
-        if (!customTex1 && gameTex1 && ctx.crc32Manager)
+        if (!customTex1 && gameTex1 && hash1 != 0 && !UnresolvedHashes().count(hash1))
         {
-            uint32_t cachedCRC32 = ctx.crc32Manager->GetCRC32ByGameHash(hash1);
-            if (cachedCRC32 != 0 && ctx.hashTable)
-                customTex1 = ctx.hashTable->GetTexture(cachedCRC32);
+            customTex1 = ResolveViaCRC32(ctx, hash1);
+            if (!customTex1) UnresolvedHashes().insert(hash1);
         }
-        if (!customTex2 && gameTex2 && ctx.crc32Manager)
+        if (!customTex2 && gameTex2 && hash2 != 0 && !UnresolvedHashes().count(hash2))
         {
-            uint32_t cachedCRC32 = ctx.crc32Manager->GetCRC32ByGameHash(hash2);
-            if (cachedCRC32 != 0 && ctx.hashTable)
-                customTex2 = ctx.hashTable->GetTexture(cachedCRC32);
+            customTex2 = ResolveViaCRC32(ctx, hash2);
+            if (!customTex2) UnresolvedHashes().insert(hash2);
         }
-        if (!customTex3 && gameTex3 && ctx.crc32Manager)
+        if (!customTex3 && gameTex3 && hash3 != 0 && !UnresolvedHashes().count(hash3))
         {
-            uint32_t cachedCRC32 = ctx.crc32Manager->GetCRC32ByGameHash(hash3);
-            if (cachedCRC32 != 0 && ctx.hashTable)
-                customTex3 = ctx.hashTable->GetTexture(cachedCRC32);
+            customTex3 = ResolveViaCRC32(ctx, hash3);
+            if (!customTex3) UnresolvedHashes().insert(hash3);
         }
     }
 
+#ifdef _DEBUG
     // Track hashes that succeeded once and later failed (diagnostics)
     static std::unordered_set<uint32_t>* successfulHashes = nullptr;
     static std::unordered_set<uint32_t>* failedAfterSuccess = nullptr;
@@ -326,6 +354,7 @@ void SwapTextures(const SwapContext& ctx)
                          hash1, failedAfterSuccess->size());
         }
     }
+#endif
 
     // Persistent storage for passing texture pointers to game's SetValue
     static IDirect3DTexture9** s_texPtr1 = new IDirect3DTexture9*(nullptr);

@@ -513,7 +513,7 @@ int TPFLoader::LoadTPFAndPostToIOCP(const std::wstring& tpfPath, DDSEntryCallbac
 
         // Extract DDS file to memory
         size_t uncompressedSize = 0;
-        void* pData = nullptr;
+        std::vector<uint8_t> entryData;
 
         if (isEncrypted)
         {
@@ -598,8 +598,8 @@ int TPFLoader::LoadTPFAndPostToIOCP(const std::wstring& tpfPath, DDSEntryCallbac
             // Now decompress the decrypted data (skip 12-byte encryption header)
             // The decrypted data is now pure DEFLATE stream
             uncompressedSize = file_stat.m_uncomp_size;
-            pData = malloc(uncompressedSize);
-            if (!pData)
+            entryData.resize(uncompressedSize);
+            if (entryData.empty() && uncompressedSize != 0)
             {
                 asi_log::Log("TPFLoader: Failed to allocate memory for %s", file_stat.m_filename);
                 free(pCompressed);
@@ -617,8 +617,8 @@ int TPFLoader::LoadTPFAndPostToIOCP(const std::wstring& tpfPath, DDSEntryCallbac
             tinfl_status status = tinfl_decompress(&inflator,
                                                    (const mz_uint8*)pCompressed + 12,
                                                    &in_bytes,
-                                                   (mz_uint8*)pData,
-                                                   (mz_uint8*)pData,
+                                                   entryData.data(),
+                                                   entryData.data(),
                                                    &out_bytes,
                                                    TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF);
 
@@ -627,21 +627,23 @@ int TPFLoader::LoadTPFAndPostToIOCP(const std::wstring& tpfPath, DDSEntryCallbac
             if (status != TINFL_STATUS_DONE)
             {
                 asi_log::Log("TPFLoader: Failed to decompress %s (status %d)", file_stat.m_filename, status);
-                free(pData);
                 continue;
             }
 
-            uncompressedSize = out_bytes;
+            entryData.resize(out_bytes);
         }
         else
         {
             // Unencrypted file - use standard extraction
-            pData = mz_zip_reader_extract_to_heap(&zip, i, &uncompressedSize, 0);
+            void* pData = mz_zip_reader_extract_to_heap(&zip, i, &uncompressedSize, 0);
             if (!pData)
             {
                 asi_log::Log("TPFLoader: Failed to extract %s", file_stat.m_filename);
                 continue;
             }
+
+            entryData.assign((const uint8_t*)pData, (const uint8_t*)pData + uncompressedSize);
+            mz_free(pData);
         }
 
         // Strip "SPEED.EXE_" prefix from filename if present
@@ -655,19 +657,13 @@ int TPFLoader::LoadTPFAndPostToIOCP(const std::wstring& tpfPath, DDSEntryCallbac
         // Parse CRC32 from filename
         uint32_t crc32Hash = ParseCRC32FromFilename(filename);
 
-        // Call callback to post DDS entry to IOCP queue
+        // Call callback to post DDS entry to IOCP queue (moves the buffer - no copy)
         // The callback will handle creating the D3D9 texture on worker thread
         if (callback)
         {
-            callback(crc32Hash, filename, (const uint8_t*)pData, uncompressedSize);
+            callback(crc32Hash, filename, std::move(entryData));
             ddsEntriesPosted++;
         }
-
-        // Free memory (use free() for manually allocated, mz_free() for miniz-allocated)
-        if (isEncrypted)
-            free(pData);
-        else
-            mz_free(pData);
     }
 
     mz_zip_reader_end(&zip);
