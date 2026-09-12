@@ -4,6 +4,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <atomic>
+#include <mutex>
 
 #include "Log.h"
 #include "TextureSwapApply.h"
@@ -28,6 +29,11 @@ bool SetMaterialTexture(void* material,
                         bool addRefTexture)
 {
     if (!material)
+        return false;
+
+    // The game-side storage is part of the ownership contract.  Without it we
+    // cannot safely detect pointer changes or keep the texture alive.
+    if (!texPtrStorage)
         return false;
 
     // Do not pass NULL textures to the game
@@ -101,6 +107,11 @@ bool SetMaterialTexture(void* material,
 std::unordered_set<uint32_t>& UnresolvedHashes()
 {
     static std::unordered_set<uint32_t>* s = new std::unordered_set<uint32_t>();
+    static bool initialized = []() {
+        s->reserve(4096);
+        return true;
+    }();
+    (void)initialized;
     return *s;
 }
 

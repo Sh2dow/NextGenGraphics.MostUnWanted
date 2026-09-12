@@ -9,6 +9,12 @@
 // Keep it inline to avoid ODR issues if included elsewhere by mistake.
 inline void BuildSwapTableEx(bool rebuild = false, CRITICAL_SECTION* swapLock = nullptr)
 {
+    // A rebuild may be requested by more than one loader completion callback.
+    // Serialize builders so that each one observes and replaces a complete
+    // published table rather than racing through the old-table teardown.
+    static std::mutex s_rebuildMutex;
+    std::lock_guard<std::mutex> rebuildGuard(s_rebuildMutex);
+
     // If already built and not forcing rebuild, skip
     if (g_swapTableBuilt.load() && !rebuild)
         return;
@@ -20,6 +26,7 @@ inline void BuildSwapTableEx(bool rebuild = false, CRITICAL_SECTION* swapLock = 
     // Solution: Build a new table, then atomically swap the pointer.
     std::unordered_map<uint32_t, IDirect3DTexture9*>* newSwapTable =
         new std::unordered_map<uint32_t, IDirect3DTexture9*>();
+    newSwapTable->reserve(ngg::mw::g_validGameTextureHashes.size());
 
     if (!g_swapTable)
     {

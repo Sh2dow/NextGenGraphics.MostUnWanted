@@ -35,6 +35,52 @@ from tpf_to_ngg import (load_crc32_cache, load_name_table,
 
 REPO = Path(__file__).resolve().parent.parent
 
+def rename_textures_to_gameid(textures_dir: Path, mappings: list[dict]) -> None:
+    """Rename each mapped .dds to <gameId>.dds and update texturePath.
+
+    gameId is sanitized for Windows (<>:"/\|?* stripped, reserved names
+    avoided). Collisions get a numeric suffix. Files that fail to rename
+    keep their original texturePath.
+    """
+    import re
+
+    def sanitize(name: str) -> str:
+        # strip path-unsafe chars
+        name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", name)
+        # avoid Windows reserved names / trailing dots & spaces
+        reserved = {"CON","PRN","AUX","NUL","COM1","COM2","COM3","COM4","COM5",
+                    "COM6","COM7","COM8","COM9","LPT1","LPT2","LPT3","LPT4",
+                    "LPT5","LPT6","LPT7","LPT8","LPT9"}
+        if name.upper() in reserved:
+            name = f"_{name}"
+        return name.rstrip(". ") or "_"
+
+    used: set[str] = set()
+    for m in mappings:
+        rel = m["texturePath"]
+        src = textures_dir / rel
+        if not src.is_file():
+            continue
+
+        base = sanitize(m["gameId"])
+        candidate = f"{base}.dds"
+        n = 1
+        while candidate in used or (textures_dir / candidate).exists() \
+                and (textures_dir / candidate) != src:
+            candidate = f"{base}_{n}.dds"
+            n += 1
+
+        dst = textures_dir / candidate
+        if src != dst:
+            try:
+                src.rename(dst)
+            except OSError as e:
+                print(f"warning: rename failed for {rel}: {e}",
+                      file=sys.stderr)
+                continue
+
+        used.add(candidate)
+        m["texturePath"] = candidate
 
 def main():
     ap = argparse.ArgumentParser(
@@ -105,15 +151,16 @@ def main():
             add(base, rel)
             stats["plain"] += 1
 
-    pack_info = {}
-    if args.id or args.name or args.author:
-        pack_info["description"] = {
-            "id": args.id or f"ngg.mw.packs.{args.pack_root.name.lower()}",
-            "game": args.game,
-            "name": args.name or args.pack_root.name,
-            "description": args.name or args.pack_root.name,
-            "author": args.author or "",
-        }
+    rename_textures_to_gameid(textures_dir, mappings)
+    
+        pack_info = {}
+    pack_info["description"] = {
+        "id": args.id or f"ngg.mw.packs.{args.pack_root.name.lower()}" or "ngg.mw.packs.test",
+        "game": args.game or "test",
+        "name": args.name or args.pack_root.name or "test",
+        "description": args.name or args.pack_root.name or "test",
+        "author": args.author or "test",
+    }
     pack_info["rootDirectory"] = args.textures_dir
     pack_info["textureMappings"] = mappings
 
